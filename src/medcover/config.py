@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     sample_fixtures_dir: Path = Field(default=Path("tests/fixtures/mcd_sample"))
     eval_queries_path: Path = Field(default=Path("tests/eval_queries.json"))
 
+    duckdb_extension_dir: Path | None = Field(default=None)
+    fastembed_cache_dir: Path | None = Field(default=None)
+
     s3_bucket: str | None = Field(default=None)
     s3_prefix: str = Field(default="gold")
 
@@ -53,6 +56,20 @@ class Settings(BaseSettings):
     def releases_dir(self) -> Path:
         """Directory holding staged Write-Audit-Publish release directories."""
         return self.data_dir / "releases"
+
+    def resolved_duckdb_extension_dir(self) -> Path | None:
+        """Return explicit or workspace-local DuckDB extension cache directory when available."""
+        if self.duckdb_extension_dir is not None:
+            return self.duckdb_extension_dir
+        local_cache = Path(".cache/duckdb_extensions")
+        return local_cache if local_cache.exists() else None
+
+    def resolved_fastembed_cache_dir(self) -> Path | None:
+        """Return explicit or workspace-local FastEmbed cache directory when available."""
+        if self.fastembed_cache_dir is not None:
+            return self.fastembed_cache_dir
+        local_cache = Path(".cache/fastembed")
+        return local_cache if local_cache.exists() else None
 
 
 def get_settings() -> Settings:

@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Sequence
+from pathlib import Path
+
+from medcover.bronze import ingest_sample_fixtures, ingest_zip_or_dir
+from medcover.config import get_settings
+from medcover.gold import build_gold
+from medcover.silver import build_silver
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -79,6 +86,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     parser = build_parser()
     args = parser.parse_args(argv)
+    settings = get_settings()
+
+    if args.command == "ingest-zip":
+        bronze_res = ingest_zip_or_dir(Path(args.input_path), settings.bronze_dir)
+        print(
+            json.dumps(
+                {
+                    "documents_path": str(bronze_res.documents_path),
+                    "total_documents": bronze_res.total_documents,
+                    "total_crosswalks": bronze_res.total_crosswalks,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.command == "build":
+        if args.sample:
+            ingest_sample_fixtures(settings)
+        silver_res = build_silver(settings)
+        gold_res = build_gold(
+            settings,
+            bronze_docs=silver_res.bronze_docs,
+            quarantined_docs=silver_res.quarantined_docs,
+        )
+        print(json.dumps(gold_res.manifest.model_dump(mode="json"), indent=2))
+        return 0
+
     msg = f"Subcommand '{args.command}' is not implemented yet."
     raise NotImplementedError(msg)
 
