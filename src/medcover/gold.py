@@ -321,18 +321,21 @@ def _pack_blocks(
     token_limit: int,
     token_overlap: int,
 ) -> list[str]:
-    expanded: list[str] = []
+    expanded: list[tuple[str, bool]] = []
     for block in blocks:
         if _is_markdown_table(block):
-            expanded.extend(_split_large_table(block, token_limit=token_limit))
-        else:
             expanded.extend(
-                _split_large_prose(block, token_limit=token_limit, token_overlap=token_overlap)
+                (piece, True) for piece in _split_large_table(block, token_limit=token_limit)
             )
+        else:
+            prose_pieces = _split_large_prose(
+                block, token_limit=token_limit, token_overlap=token_overlap
+            )
+            expanded.extend((piece, idx > 0) for idx, piece in enumerate(prose_pieces))
 
     packed: list[str] = []
     current = ""
-    for piece in expanded:
+    for piece, skip_overlap in expanded:
         if not current:
             current = piece
             continue
@@ -342,8 +345,8 @@ def _pack_blocks(
             continue
 
         packed.append(current)
-        overlap = _tail_overlap_text(current, token_overlap=token_overlap)
-        if overlap and not _is_markdown_table(piece):
+        overlap = "" if skip_overlap else _tail_overlap_text(current, token_overlap=token_overlap)
+        if overlap:
             with_overlap = f"{overlap}\n\n{piece}"
             current = with_overlap if count_tokens(with_overlap) <= token_limit else piece
         else:
@@ -571,7 +574,9 @@ def _write_gold_chunks_parquet(
 ) -> None:
     records = [
         {
-            key: (None if isinstance(value, float) and pd.isna(value) else value)
+            key: (
+                None if value is pd.NaT or (isinstance(value, float) and pd.isna(value)) else value
+            )
             for key, value in row.items()
         }
         for row in df.to_dict(orient="records")
@@ -659,7 +664,7 @@ def _to_date(value: Any) -> date:
 
 
 def _to_optional_date(value: Any) -> date | None:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    if value is None or value is pd.NaT or (isinstance(value, float) and pd.isna(value)):
         return None
     if isinstance(value, pd.Timestamp):
         return None if pd.isna(value) else value.date()

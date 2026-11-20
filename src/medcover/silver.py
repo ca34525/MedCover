@@ -318,7 +318,9 @@ def _aggregate_silver_policies(
 def _write_silver_policies_parquet(df: pd.DataFrame, output_path: Path) -> None:
     records = [
         {
-            key: (None if isinstance(value, float) and pd.isna(value) else value)
+            key: (
+                None if value is pd.NaT or (isinstance(value, float) and pd.isna(value)) else value
+            )
             for key, value in row.items()
         }
         for row in df.to_dict(orient="records")
@@ -334,20 +336,20 @@ def _build_quarantine_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
 
 
 def _opt_str(value: Any) -> str | None:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    if value is None or value is pd.NaT or (isinstance(value, float) and pd.isna(value)):
         return None
     text = str(value).strip()
     return text if text else None
 
 
 def _opt_int(value: Any) -> int | None:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    if value is None or value is pd.NaT or (isinstance(value, float) and pd.isna(value)):
         return None
     return int(value)
 
 
 def _opt_date(value: Any) -> date | None:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    if value is None or value is pd.NaT or (isinstance(value, float) and pd.isna(value)):
         return None
     if isinstance(value, pd.Timestamp):
         if pd.isna(value):

@@ -60,3 +60,27 @@ def test_cli_exposes_all_spec_subcommands() -> None:
     ]:
         parsed = parser.parse_args(argv)
         assert parsed.command == expected
+
+
+def test_cli_build_sample_isolates_from_primary_data_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify `medcover build --sample` writes to data_dir/sample without touching primary data."""
+    from medcover import cli, gold
+
+    primary_bronze = tmp_path / "bronze"
+    primary_bronze.mkdir()
+    sentinel = primary_bronze / "raw_documents.parquet"
+    sentinel.write_bytes(b"existing-production-bronze")
+
+    monkeypatch.setenv("MEDCOVER_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        gold,
+        "_embed_with_fastembed",
+        lambda texts, *, settings: [[0.0] * settings.embedding_dim for _ in texts],
+    )
+
+    assert cli.main(["build", "--sample"]) == 0
+    assert sentinel.read_bytes() == b"existing-production-bronze"
+    assert (tmp_path / "sample" / "gold" / "chunks.parquet").exists()

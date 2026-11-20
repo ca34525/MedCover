@@ -48,6 +48,7 @@ def test_silver_zero_code_fanout_and_distinct_arrays(tmp_path: Path) -> None:
     assert list(l33822["cpt_codes"]) == ["72148", "72149", "72158"]
     assert list(l33822["icd10_codes"]) == ["G83.4", "M51.16", "M54.50"]
     assert bool(l33822["is_active"]) is True
+    assert pd.isna(l33822["retired_date"])
 
     # L33381 is retired and must carry is_active == False.
     l33381 = policies_df[policies_df["doc_id"] == "L33381"].iloc[0]

@@ -69,9 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include retired policies in search results.",
     )
 
-    subparsers.add_parser(
+    eval_cmd = subparsers.add_parser(
         "eval",
         help="Run golden retrieval evaluation (Recall@5, MRR, active filter compliance).",
+    )
+    eval_cmd.add_argument(
+        "--sample",
+        action="store_true",
+        help="Evaluate against isolated sample build artifacts.",
     )
 
     return parser
@@ -104,6 +109,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "build":
         if args.sample:
+            settings = settings.model_copy(update={"data_dir": settings.data_dir / "sample"})
             ingest_sample_fixtures(settings)
         silver_res = build_silver(settings)
         gold_res = build_gold(

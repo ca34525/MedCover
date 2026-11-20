@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import io
 import zipfile
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from medcover.bronze import ingest_sample_fixtures, ingest_zip_or_dir
 from medcover.config import Settings
@@ -75,3 +77,60 @@ def test_bronze_upsert_preserves_historical_versions(tmp_path: Path) -> None:
 
     assert len(docs_df) == 2
     assert list(docs_df["version"]) == [1, 2]
+
+
+def test_bronze_reingest_replaces_obsolete_crosswalks(tmp_path: Path) -> None:
+    """Verify re-ingestion keeps crosswalk count stable and removes dropped codes."""
+    settings = Settings(data_dir=tmp_path)
+    first = ingest_sample_fixtures(settings)
+    second = ingest_sample_fixtures(settings)
+    assert second.total_crosswalks == first.total_crosswalks
+
+    updated_codes = tmp_path / "updated_crosswalks.csv"
+    updated_codes.write_text(
+        "doc_id,version,code_system,code\nL33822,12,CPT,72148\n",
+        encoding="utf-8",
+    )
+    ingest_zip_or_dir(updated_codes, settings.bronze_dir)
+    codes_df = pd.read_parquet(settings.bronze_dir / "raw_code_crosswalks.parquet")
+    l33822_codes = codes_df[(codes_df["doc_id"] == "L33822") & (codes_df["version"] == 12)]
+    assert list(l33822_codes["code"]) == ["72148"]
+
+
+def test_cms_bulk_lcd_columns_dates_and_unrecognized_archive(tmp_path: Path) -> None:
+    """Verify CMS MCD bulk headers and US dates ingest cleanly and empty/unknown CSVs fail."""
+    cms_dir = tmp_path / "cms_bulk"
+    cms_dir.mkdir()
+    (cms_dir / "lcd.csv").write_text(
+        "lcd_id,lcd_version,title,indication,orig_det_eff_date,ret_date,status\n"
+        '35391,3,Lumbar MRI,"<p>Radiculopathy criteria</p>",04/01/2024,,A\n'
+        '35392,1,Bad Date Policy,"<p>Body</p>",not-a-date,,A\n',
+        encoding="utf-8",
+    )
+    (cms_dir / "lcd_x_hcpc_code.csv").write_text(
+        "lcd_id,lcd_version,hcpc_code_id\n35391,3,72148\n35391,3,E0601\n",
+        encoding="utf-8",
+    )
+
+    result = ingest_zip_or_dir(cms_dir, tmp_path / "bronze")
+    docs_df = pd.read_parquet(result.documents_path)
+    codes_df = pd.read_parquet(result.crosswalks_path)
+
+    assert result.total_documents == 2
+    assert set(docs_df["doc_id"]) == {"L35391", "L35392"}
+    l35391 = docs_df[docs_df["doc_id"] == "L35391"].iloc[0]
+    assert l35391["doc_type"] == "LCD"
+    assert l35391["effective_date"] == date(2024, 4, 1)
+    assert pd.isna(l35391["retired_date"])
+    assert l35391["status"] == "ACTIVE"
+    l35392 = docs_df[docs_df["doc_id"] == "L35392"].iloc[0]
+    assert pd.isna(l35392["effective_date"])
+    assert set(zip(codes_df["code_system"], codes_df["code"], strict=True)) == {
+        ("CPT", "72148"),
+        ("HCPCS", "E0601"),
+    }
+
+    unknown_csv = tmp_path / "unknown.csv"
+    unknown_csv.write_text("foo,bar\n1,2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="No recognized CMS policy"):
+        ingest_zip_or_dir(unknown_csv, tmp_path / "bronze_empty")

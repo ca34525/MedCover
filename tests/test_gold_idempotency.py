@@ -42,6 +42,18 @@ def test_chunk_markdown_preserves_table_rows_on_split() -> None:
                 assert line.startswith("|") and line.endswith("|")
 
 
+def test_chunk_markdown_does_not_duplicate_overlap_on_long_paragraph() -> None:
+    """Verify a prose paragraph exceeding token_limit applies overlap once, not twice."""
+    words = [f"word{i}" for i in range(451)]
+    md = "## Criteria\n\n" + " ".join(words)
+
+    chunks = chunk_markdown(md, default_heading="Test", token_limit=450, token_overlap=60)
+    assert len(chunks) == 2
+    assert chunks[0].token_count == 450
+    assert chunks[1].token_count == 61
+    assert chunks[1].chunk_text.split() == words[390:451]
+
+
 def test_gold_idempotency_and_delta_reembed(tmp_path: Path) -> None:
     """Verify repeat Gold run embeds 0 chunks and 1-doc edit re-embeds only its delta chunks."""
     settings = Settings(data_dir=tmp_path)
@@ -86,6 +98,8 @@ def test_gold_idempotency_and_delta_reembed(tmp_path: Path) -> None:
         embed_fn=_deterministic_embed,
     )
     chunks_df = pd.read_parquet(third.chunks_path)
+    active_chunks = chunks_df[chunks_df["is_active"]]
+    assert active_chunks["retired_date"].isna().all()
     ncd_chunks = int((chunks_df["doc_id"] == "NCD190.15").sum())
 
     assert third.manifest.chunks_embedded > 0
