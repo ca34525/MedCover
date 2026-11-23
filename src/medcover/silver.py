@@ -3,62 +3,51 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 import duckdb
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from bs4 import BeautifulSoup
-from markdownify import markdownify
+from markdownify import MarkdownConverter
 
 from medcover.config import Settings
 from medcover.contracts import (
+    BRONZE_CROSSWALKS_ARROW_SCHEMA,
+    SILVER_POLICIES_ARROW_SCHEMA,
+    SILVER_POLICIES_SCHEMA,
+    SILVER_QUARANTINE_ARROW_SCHEMA,
+    SILVER_QUARANTINE_SCHEMA,
     VALID_DOC_TYPES,
     VALID_SOURCE_MODES,
     VALID_STATUSES,
-    validate_silver_policies,
-    validate_silver_quarantine,
+    parse_optional_date,
+    parse_optional_int,
+    parse_optional_str,
 )
 from medcover.sql import load_sql
 
-SILVER_QUARANTINE_COLUMNS: tuple[str, ...] = (
-    "doc_id",
-    "doc_type",
-    "version",
-    "title",
-    "effective_date",
-    "retired_date",
-    "status",
-    "source_mode",
-    "source_sha256",
-    "failure_reason",
-    "quarantined_at",
-)
+_BLANK_LINES_RE = re.compile(r"\n{3,}")
 
-SILVER_POLICIES_ARROW_SCHEMA = pa.schema(
+_SILVER_VALID_DOCS_SCHEMA = pa.schema(
     [
-        pa.field("doc_id", pa.string(), nullable=False),
-        pa.field("doc_type", pa.string(), nullable=False),
-        pa.field("version", pa.int64(), nullable=False),
-        pa.field("title", pa.string(), nullable=False),
-        pa.field("markdown_text", pa.string(), nullable=False),
-        pa.field("cpt_codes", pa.list_(pa.string()), nullable=False),
-        pa.field("icd10_codes", pa.list_(pa.string()), nullable=False),
-        pa.field("mac_jurisdiction", pa.string(), nullable=True),
-        pa.field("effective_date", pa.date32(), nullable=False),
-        pa.field("retired_date", pa.date32(), nullable=True),
-        pa.field("status", pa.string(), nullable=False),
-        pa.field("is_active", pa.bool_(), nullable=False),
-        pa.field("source_mode", pa.string(), nullable=False),
-        pa.field("source_sha256", pa.string(), nullable=False),
+        pa.field("doc_id", pa.string()),
+        pa.field("doc_type", pa.string()),
+        pa.field("version", pa.int64()),
+        pa.field("title", pa.string()),
+        pa.field("markdown_text", pa.string()),
+        pa.field("mac_jurisdiction", pa.string()),
+        pa.field("effective_date", pa.date32()),
+        pa.field("retired_date", pa.date32()),
+        pa.field("status", pa.string()),
+        pa.field("source_mode", pa.string()),
+        pa.field("source_sha256", pa.string()),
     ]
 )
-
-_BLANK_LINES_RE = re.compile(r"\n{3,}")
 
 
 @dataclass(frozen=True)
@@ -84,8 +73,8 @@ def html_to_markdown(raw_html: str | None) -> str:
 
     Inputs: raw HTML string (nullable).
     Output grain: single cleaned Markdown string (empty string if input has no textual content).
-    Invariants: preserves ATX headings (``#``, ``##``, ``###``) and Markdown pipe tables;
-    strips ``<script>`` and ``<style>`` blocks cleanly without naive tag-stripping regexes.
+    Invariants: parses the HTML DOM once, preserves ATX headings (``#``, ``##``, ``###``) and
+    Markdown pipe tables, and strips ``<script>`` / ``<style>`` / ``<noscript>`` cleanly.
     """
     if raw_html is None or not raw_html.strip():
         return ""
@@ -98,16 +87,10 @@ def html_to_markdown(raw_html: str | None) -> str:
         return ""
 
     rendered = str(
-        markdownify(
-            str(soup),
-            heading_style="ATX",
-            bullets="-",
-            strip=["img"],
-        )
+        MarkdownConverter(heading_style="ATX", bullets="-", strip=["img"]).convert_soup(soup)
     )
     lines = [line.rstrip() for line in rendered.replace("\r\n", "\n").splitlines()]
-    normalized = _BLANK_LINES_RE.sub("\n\n", "\n".join(lines)).strip()
-    return normalized
+    return _BLANK_LINES_RE.sub("\n\n", "\n".join(lines)).strip()
 
 
 def build_silver(settings: Settings) -> SilverResult:
@@ -125,11 +108,13 @@ def build_silver(settings: Settings) -> SilverResult:
         msg = f"Bronze documents file not found: {bronze_docs_path}"
         raise FileNotFoundError(msg)
 
-    bronze_docs = pd.read_parquet(bronze_docs_path)
-    bronze_codes = (
-        pd.read_parquet(bronze_codes_path)
+    bronze_docs = pq.read_table(bronze_docs_path).to_pylist()
+    codes_table = (
+        pq.read_table(bronze_codes_path)
+        .select(BRONZE_CROSSWALKS_ARROW_SCHEMA.names)
+        .cast(BRONZE_CROSSWALKS_ARROW_SCHEMA)
         if bronze_codes_path.exists()
-        else pd.DataFrame(columns=["doc_id", "version", "code_system", "code"])
+        else pa.Table.from_pylist([], schema=BRONZE_CROSSWALKS_ARROW_SCHEMA)
     )
 
     valid_rows, quarantined_rows = _partition_and_clean(bronze_docs)
@@ -138,42 +123,45 @@ def build_silver(settings: Settings) -> SilverResult:
     policies_path = settings.silver_dir / "policies.parquet"
     quarantine_path = settings.silver_dir / "quarantine.parquet"
 
-    quarantine_df = _build_quarantine_frame(quarantined_rows)
-    validate_silver_quarantine(quarantine_df)
-    quarantine_df.to_parquet(quarantine_path, index=False)
+    quarantine_table = pa.Table.from_pylist(
+        quarantined_rows,
+        schema=SILVER_QUARANTINE_ARROW_SCHEMA,
+    )
+    SILVER_QUARANTINE_SCHEMA.validate(quarantine_table.to_pandas())
+    pq.write_table(quarantine_table, quarantine_path)
 
-    policies_df = _aggregate_silver_policies(valid_rows, bronze_codes)
-    validate_silver_policies(policies_df)
-    _write_silver_policies_parquet(policies_df, policies_path)
+    policies_table = _aggregate_silver_policies(valid_rows, codes_table)
+    SILVER_POLICIES_SCHEMA.validate(policies_table.to_pandas())
+    pq.write_table(policies_table, policies_path)
 
     return SilverResult(
         policies_path=policies_path,
         quarantine_path=quarantine_path,
         bronze_docs=len(bronze_docs),
-        silver_docs=len(policies_df),
-        quarantined_docs=len(quarantine_df),
+        silver_docs=policies_table.num_rows,
+        quarantined_docs=quarantine_table.num_rows,
     )
 
 
 def _partition_and_clean(
-    bronze_docs: pd.DataFrame,
+    bronze_docs: Sequence[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     valid_rows: list[dict[str, Any]] = []
     quarantined_rows: list[dict[str, Any]] = []
     quarantined_at = datetime.now(tz=UTC)
 
-    for record in bronze_docs.to_dict(orient="records"):
-        doc_id = _opt_str(record.get("doc_id"))
-        doc_type = _opt_str(record.get("doc_type"))
-        version = _opt_int(record.get("version"))
-        title = _opt_str(record.get("title"))
-        raw_html = _opt_str(record.get("raw_html"))
-        mac_jurisdiction = _opt_str(record.get("mac_jurisdiction"))
-        effective_date = _opt_date(record.get("effective_date"))
-        retired_date = _opt_date(record.get("retired_date"))
-        status = _opt_str(record.get("status"))
-        source_mode = _opt_str(record.get("source_mode"))
-        source_sha256 = _opt_str(record.get("source_sha256"))
+    for record in bronze_docs:
+        doc_id = parse_optional_str(record.get("doc_id"))
+        doc_type = parse_optional_str(record.get("doc_type"))
+        version = parse_optional_int(record.get("version"))
+        title = parse_optional_str(record.get("title"))
+        raw_html = parse_optional_str(record.get("raw_html"))
+        mac_jurisdiction = parse_optional_str(record.get("mac_jurisdiction"))
+        effective_date = parse_optional_date(record.get("effective_date"))
+        retired_date = parse_optional_date(record.get("retired_date"))
+        status = parse_optional_str(record.get("status"))
+        source_mode = parse_optional_str(record.get("source_mode"))
+        source_sha256 = parse_optional_str(record.get("source_sha256"))
 
         markdown_text = html_to_markdown(raw_html)
         reasons = _collect_failure_reasons(
@@ -261,103 +249,18 @@ def _collect_failure_reasons(
 
 def _aggregate_silver_policies(
     valid_rows: list[dict[str, Any]],
-    bronze_codes: pd.DataFrame,
-) -> pd.DataFrame:
+    codes_table: pa.Table,
+) -> pa.Table:
     if not valid_rows:
-        return pd.DataFrame(
-            columns=[field.name for field in SILVER_POLICIES_ARROW_SCHEMA],
-        )
+        return pa.Table.from_pylist([], schema=SILVER_POLICIES_ARROW_SCHEMA)
 
-    valid_table = pa.Table.from_pylist(
-        valid_rows,
-        schema=pa.schema(
-            [
-                pa.field("doc_id", pa.string()),
-                pa.field("doc_type", pa.string()),
-                pa.field("version", pa.int64()),
-                pa.field("title", pa.string()),
-                pa.field("markdown_text", pa.string()),
-                pa.field("mac_jurisdiction", pa.string()),
-                pa.field("effective_date", pa.date32()),
-                pa.field("retired_date", pa.date32()),
-                pa.field("status", pa.string()),
-                pa.field("source_mode", pa.string()),
-                pa.field("source_sha256", pa.string()),
-            ]
-        ),
-    )
-
-    codes_table = pa.Table.from_pandas(
-        bronze_codes.reindex(columns=["doc_id", "version", "code_system", "code"]),
-        schema=pa.schema(
-            [
-                pa.field("doc_id", pa.string()),
-                pa.field("version", pa.int64()),
-                pa.field("code_system", pa.string()),
-                pa.field("code", pa.string()),
-            ]
-        ),
-        preserve_index=False,
-    )
-
+    valid_table = pa.Table.from_pylist(valid_rows, schema=_SILVER_VALID_DOCS_SCHEMA)
     sql = load_sql("silver_policies.sql")
     with duckdb.connect(":memory:") as con:
         con.register("silver_valid_docs", valid_table)
         con.register("raw_code_crosswalks", codes_table)
-        result_df = con.execute(sql).df()
+        arrow_result = con.sql(sql).to_arrow_table()
 
-    result_df["cpt_codes"] = result_df["cpt_codes"].map(lambda value: list(value))
-    result_df["icd10_codes"] = result_df["icd10_codes"].map(lambda value: list(value))
-    result_df["mac_jurisdiction"] = result_df["mac_jurisdiction"].map(_opt_str)
-    result_df["effective_date"] = result_df["effective_date"].map(_opt_date)
-    result_df["retired_date"] = result_df["retired_date"].map(_opt_date)
-    result_df["is_active"] = result_df["is_active"].astype(bool)
-    return result_df
-
-
-def _write_silver_policies_parquet(df: pd.DataFrame, output_path: Path) -> None:
-    records = [
-        {
-            key: (
-                None if value is pd.NaT or (isinstance(value, float) and pd.isna(value)) else value
-            )
-            for key, value in row.items()
-        }
-        for row in df.to_dict(orient="records")
-    ]
-    table = pa.Table.from_pylist(records, schema=SILVER_POLICIES_ARROW_SCHEMA)
-    pq.write_table(table, output_path)
-
-
-def _build_quarantine_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame(columns=list(SILVER_QUARANTINE_COLUMNS))
-    return pd.DataFrame(rows).reindex(columns=list(SILVER_QUARANTINE_COLUMNS))
-
-
-def _opt_str(value: Any) -> str | None:
-    if value is None or value is pd.NaT or (isinstance(value, float) and pd.isna(value)):
-        return None
-    text = str(value).strip()
-    return text if text else None
-
-
-def _opt_int(value: Any) -> int | None:
-    if value is None or value is pd.NaT or (isinstance(value, float) and pd.isna(value)):
-        return None
-    return int(value)
-
-
-def _opt_date(value: Any) -> date | None:
-    if value is None or value is pd.NaT or (isinstance(value, float) and pd.isna(value)):
-        return None
-    if isinstance(value, pd.Timestamp):
-        if pd.isna(value):
-            return None
-        return value.date()
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    text = _opt_str(value)
-    return date.fromisoformat(text[:10]) if text else None
+    return arrow_result.select(SILVER_POLICIES_ARROW_SCHEMA.names).cast(
+        SILVER_POLICIES_ARROW_SCHEMA
+    )

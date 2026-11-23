@@ -1,12 +1,13 @@
-"""Pydantic domain models, Pandera DataFrame contracts, and RunManifest schema."""
+"""Canonical Arrow schemas, Pandera contracts, RunManifest, and scalar parsers."""
 
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import pandas as pd
 import pandera.pandas as pa
+import pyarrow
 from pydantic import BaseModel, Field
 
 DocType = Literal["NCD", "LCD", "ARTICLE"]
@@ -14,36 +15,16 @@ PolicyStatus = Literal["ACTIVE", "RETIRED"]
 SourceMode = Literal["zip", "api"]
 CodeSystem = Literal["CPT", "HCPCS", "ICD10"]
 
-VALID_DOC_TYPES: frozenset[str] = frozenset({"NCD", "LCD", "ARTICLE"})
-VALID_STATUSES: frozenset[str] = frozenset({"ACTIVE", "RETIRED"})
-VALID_SOURCE_MODES: frozenset[str] = frozenset({"zip", "api"})
-VALID_CODE_SYSTEMS: frozenset[str] = frozenset({"CPT", "HCPCS", "ICD10"})
+VALID_DOC_TYPES: frozenset[str] = frozenset(get_args(DocType))
+VALID_STATUSES: frozenset[str] = frozenset(get_args(PolicyStatus))
+VALID_SOURCE_MODES: frozenset[str] = frozenset(get_args(SourceMode))
+VALID_CODE_SYSTEMS: frozenset[str] = frozenset(get_args(CodeSystem))
 
-
-class BronzeDocument(BaseModel):
-    """Canonical Bronze document record prior to Silver HTML cleaning and quarantine checks."""
-
-    doc_id: str
-    doc_type: str
-    version: int = Field(ge=1)
-    title: str | None = None
-    raw_html: str | None = None
-    mac_jurisdiction: str | None = None
-    effective_date: date | None = None
-    retired_date: date | None = None
-    status: str | None = None
-    source_mode: SourceMode
-    ingested_at: datetime
-    source_sha256: str = Field(min_length=64, max_length=64)
-
-
-class BronzeCodeCrosswalk(BaseModel):
-    """Single billing or diagnosis code link associated with a Bronze policy version."""
-
-    doc_id: str
-    version: int = Field(ge=1)
-    code_system: CodeSystem
-    code: str = Field(min_length=1)
+_CMS_US_DATE_FORMATS: tuple[str, ...] = (
+    "%m/%d/%Y",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y %I:%M:%S %p",
+)
 
 
 class RunManifest(BaseModel):
@@ -65,6 +46,83 @@ class RunManifest(BaseModel):
     eval_recall_at_5: float | None = Field(default=None, ge=0.0, le=1.0)
     eval_mrr: float | None = Field(default=None, ge=0.0, le=1.0)
     active_filter_violations: int | None = Field(default=None, ge=0)
+
+
+def parse_optional_str(value: Any) -> str | None:
+    """Normalize a nullable value to a stripped non-empty string or ``None``.
+
+    Inputs: arbitrary scalar from CSV, Parquet, Arrow, or Pandas.
+    Output grain: single ``str | None``.
+    Invariants: treats ``None``, ``pd.NaT``, ``NaN``, and blank strings as ``None``.
+    """
+    if _is_missing(value):
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def parse_optional_int(value: Any) -> int | None:
+    """Parse a nullable integer without raising on malformed strings.
+
+    Inputs: arbitrary scalar from CSV, Parquet, Arrow, or Pandas.
+    Output grain: single ``int | None``.
+    Invariants: rejects booleans, non-integral floats, and non-numeric strings as ``None``.
+    """
+    if _is_missing(value) or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    text = parse_optional_str(value)
+    if text is None:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def parse_optional_date(value: Any) -> date | None:
+    """Strictly parse ISO-8601 or CMS US date/datetime strings into ``datetime.date``.
+
+    Inputs: nullable ``date``, ``datetime``, ``pd.Timestamp``, or string.
+    Output grain: single ``date | None``.
+    Invariants: rejects trailing garbage and malformed dates by returning ``None``.
+    """
+    if _is_missing(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.date()
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = parse_optional_str(value)
+    if text is None:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(text).date()
+    except ValueError:
+        pass
+    for fmt in _CMS_US_DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _is_missing(value: Any) -> bool:
+    if value is None or value is pd.NaT:
+        return True
+    if isinstance(value, float) and bool(pd.isna(value)):
+        return True
+    return isinstance(value, pd.Timestamp) and bool(pd.isna(value))
 
 
 def _all_non_empty_strings(series: pd.Series[Any]) -> bool:
@@ -104,6 +162,101 @@ def _retired_not_before_effective(df: pd.DataFrame) -> bool:
     retired = pd.to_datetime(df.loc[mask, "retired_date"]).dt.date
     effective = pd.to_datetime(df.loc[mask, "effective_date"]).dt.date
     return bool((retired >= effective).all())
+
+
+BRONZE_DOCUMENTS_ARROW_SCHEMA = pyarrow.schema(
+    [
+        pyarrow.field("doc_id", pyarrow.string(), nullable=False),
+        pyarrow.field("doc_type", pyarrow.string(), nullable=True),
+        pyarrow.field("version", pyarrow.int64(), nullable=False),
+        pyarrow.field("title", pyarrow.string(), nullable=True),
+        pyarrow.field("raw_html", pyarrow.string(), nullable=True),
+        pyarrow.field("mac_jurisdiction", pyarrow.string(), nullable=True),
+        pyarrow.field("effective_date", pyarrow.date32(), nullable=True),
+        pyarrow.field("retired_date", pyarrow.date32(), nullable=True),
+        pyarrow.field("status", pyarrow.string(), nullable=True),
+        pyarrow.field("source_mode", pyarrow.string(), nullable=False),
+        pyarrow.field("ingested_at", pyarrow.timestamp("us", tz="UTC"), nullable=False),
+        pyarrow.field("source_sha256", pyarrow.string(), nullable=False),
+    ]
+)
+
+BRONZE_CROSSWALKS_ARROW_SCHEMA = pyarrow.schema(
+    [
+        pyarrow.field("doc_id", pyarrow.string(), nullable=False),
+        pyarrow.field("version", pyarrow.int64(), nullable=False),
+        pyarrow.field("code_system", pyarrow.string(), nullable=False),
+        pyarrow.field("code", pyarrow.string(), nullable=False),
+    ]
+)
+
+SILVER_POLICIES_ARROW_SCHEMA = pyarrow.schema(
+    [
+        pyarrow.field("doc_id", pyarrow.string(), nullable=False),
+        pyarrow.field("doc_type", pyarrow.string(), nullable=False),
+        pyarrow.field("version", pyarrow.int64(), nullable=False),
+        pyarrow.field("title", pyarrow.string(), nullable=False),
+        pyarrow.field("markdown_text", pyarrow.string(), nullable=False),
+        pyarrow.field("cpt_codes", pyarrow.list_(pyarrow.string()), nullable=False),
+        pyarrow.field("icd10_codes", pyarrow.list_(pyarrow.string()), nullable=False),
+        pyarrow.field("mac_jurisdiction", pyarrow.string(), nullable=True),
+        pyarrow.field("effective_date", pyarrow.date32(), nullable=False),
+        pyarrow.field("retired_date", pyarrow.date32(), nullable=True),
+        pyarrow.field("status", pyarrow.string(), nullable=False),
+        pyarrow.field("is_active", pyarrow.bool_(), nullable=False),
+        pyarrow.field("source_mode", pyarrow.string(), nullable=False),
+        pyarrow.field("source_sha256", pyarrow.string(), nullable=False),
+    ]
+)
+
+SILVER_QUARANTINE_ARROW_SCHEMA = pyarrow.schema(
+    [
+        pyarrow.field("doc_id", pyarrow.string(), nullable=True),
+        pyarrow.field("doc_type", pyarrow.string(), nullable=True),
+        pyarrow.field("version", pyarrow.int64(), nullable=True),
+        pyarrow.field("title", pyarrow.string(), nullable=True),
+        pyarrow.field("effective_date", pyarrow.date32(), nullable=True),
+        pyarrow.field("retired_date", pyarrow.date32(), nullable=True),
+        pyarrow.field("status", pyarrow.string(), nullable=True),
+        pyarrow.field("source_mode", pyarrow.string(), nullable=True),
+        pyarrow.field("source_sha256", pyarrow.string(), nullable=True),
+        pyarrow.field("failure_reason", pyarrow.string(), nullable=False),
+        pyarrow.field("quarantined_at", pyarrow.timestamp("us", tz="UTC"), nullable=False),
+    ]
+)
+
+
+def gold_chunks_arrow_schema(embedding_dim: int = 384) -> pyarrow.Schema:
+    """Build the canonical Arrow schema for ``gold/chunks.parquet``.
+
+    Inputs: expected fixed-size embedding vector dimension (default 384).
+    Output grain: Arrow schema matching ``(doc_id, version, chunk_index)`` chunk rows.
+    Invariants: fixed-size ``float32[dim]`` vectors and list-typed CPT/ICD-10 code arrays.
+    """
+    return pyarrow.schema(
+        [
+            pyarrow.field("chunk_id", pyarrow.string(), nullable=False),
+            pyarrow.field("doc_id", pyarrow.string(), nullable=False),
+            pyarrow.field("doc_type", pyarrow.string(), nullable=False),
+            pyarrow.field("version", pyarrow.int64(), nullable=False),
+            pyarrow.field("chunk_index", pyarrow.int64(), nullable=False),
+            pyarrow.field("title", pyarrow.string(), nullable=False),
+            pyarrow.field("section_heading", pyarrow.string(), nullable=False),
+            pyarrow.field("chunk_text", pyarrow.string(), nullable=False),
+            pyarrow.field("token_count", pyarrow.int64(), nullable=False),
+            pyarrow.field("chunk_sha256", pyarrow.string(), nullable=False),
+            pyarrow.field("cpt_codes", pyarrow.list_(pyarrow.string()), nullable=False),
+            pyarrow.field("icd10_codes", pyarrow.list_(pyarrow.string()), nullable=False),
+            pyarrow.field("mac_jurisdiction", pyarrow.string(), nullable=True),
+            pyarrow.field("effective_date", pyarrow.date32(), nullable=False),
+            pyarrow.field("retired_date", pyarrow.date32(), nullable=True),
+            pyarrow.field("is_active", pyarrow.bool_(), nullable=False),
+            pyarrow.field(
+                "embedding", pyarrow.list_(pyarrow.float32(), embedding_dim), nullable=False
+            ),
+            pyarrow.field("embedding_model", pyarrow.string(), nullable=False),
+        ]
+    )
 
 
 BRONZE_DOCUMENTS_SCHEMA = pa.DataFrameSchema(
@@ -282,54 +435,3 @@ def build_gold_chunks_schema(embedding_dim: int = 384) -> pa.DataFrameSchema:
         strict=True,
         unique=["doc_id", "version", "chunk_index"],
     )
-
-
-def validate_bronze_documents(df: pd.DataFrame) -> pd.DataFrame:
-    """Validate Bronze raw documents DataFrame against ``BRONZE_DOCUMENTS_SCHEMA``.
-
-    Inputs: Bronze documents DataFrame.
-    Output grain: validated DataFrame unique on ``(doc_id, version)``.
-    Invariants: raises ``pandera.errors.SchemaError`` on schema or uniqueness violation.
-    """
-    return BRONZE_DOCUMENTS_SCHEMA.validate(df)
-
-
-def validate_bronze_crosswalks(df: pd.DataFrame) -> pd.DataFrame:
-    """Validate Bronze code crosswalks DataFrame against ``BRONZE_CROSSWALKS_SCHEMA``.
-
-    Inputs: Bronze code crosswalks DataFrame.
-    Output grain: validated code link rows.
-    Invariants: ``code_system`` is strictly in ``{CPT, HCPCS, ICD10}``.
-    """
-    return BRONZE_CROSSWALKS_SCHEMA.validate(df)
-
-
-def validate_silver_policies(df: pd.DataFrame) -> pd.DataFrame:
-    """Validate Silver policies DataFrame against ``SILVER_POLICIES_SCHEMA``.
-
-    Inputs: Silver policies DataFrame.
-    Output grain: validated DataFrame unique on ``(doc_id, version)``.
-    Invariants: non-empty Markdown, list-typed code arrays, ``retired_date >= effective_date``.
-    """
-    return SILVER_POLICIES_SCHEMA.validate(df)
-
-
-def validate_silver_quarantine(df: pd.DataFrame) -> pd.DataFrame:
-    """Validate Silver quarantine DataFrame against ``SILVER_QUARANTINE_SCHEMA``.
-
-    Inputs: Silver quarantine DataFrame.
-    Output grain: validated dead-letter records with non-empty ``failure_reason``.
-    Invariants: every quarantined row records why it was rejected.
-    """
-    return SILVER_QUARANTINE_SCHEMA.validate(df)
-
-
-def validate_gold_chunks(df: pd.DataFrame, embedding_dim: int = 384) -> pd.DataFrame:
-    """Validate Gold chunks DataFrame against the Gold Pandera contract.
-
-    Inputs: Gold chunks DataFrame and expected embedding dimension.
-    Output grain: validated DataFrame unique on ``(doc_id, version, chunk_index)``.
-    Invariants: non-empty chunk text, unique ``chunk_id``, non-null ``FLOAT[dim]`` vectors.
-    """
-    schema = build_gold_chunks_schema(embedding_dim=embedding_dim)
-    return schema.validate(df)

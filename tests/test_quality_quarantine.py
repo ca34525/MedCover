@@ -8,6 +8,7 @@ import pandas as pd
 
 from medcover.bronze import ingest_sample_fixtures, ingest_zip_or_dir
 from medcover.config import Settings
+from medcover.gold import build_gold
 from medcover.silver import build_silver
 
 
@@ -54,3 +55,46 @@ def test_missing_title_and_date_inversion_quarantined(tmp_path: Path) -> None:
     assert "missing_title" in reasons["L11111"]
     assert "retired_date_before_effective_date" in reasons["L22222"]
     assert silver_res.quarantine_rate > settings.max_quarantine_rate
+
+
+def test_all_quarantined_batch_and_malformed_bronze_strings(tmp_path: Path) -> None:
+    """Verify 0-valid-row batches pass Silver and Gold Pandera/Arrow contracts cleanly."""
+    settings = Settings(data_dir=tmp_path)
+    settings.bronze_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "doc_id": "L44444",
+                "doc_type": "LCD",
+                "version": "not-an-int",
+                "title": "Bad Types",
+                "raw_html": "<p>Text</p>",
+                "mac_jurisdiction": None,
+                "effective_date": "not-a-date",
+                "retired_date": None,
+                "status": "ACTIVE",
+                "source_mode": "zip",
+                "ingested_at": pd.Timestamp("2025-01-01T00:00:00Z"),
+                "source_sha256": "a" * 64,
+            }
+        ]
+    ).to_parquet(settings.bronze_dir / "raw_documents.parquet", index=False)
+
+    silver_res = build_silver(settings)
+    assert silver_res.silver_docs == 0
+    assert silver_res.quarantined_docs == 1
+
+    quarantine_df = pd.read_parquet(silver_res.quarantine_path)
+    reason = str(quarantine_df.iloc[0]["failure_reason"])
+    assert "invalid_version" in reason
+    assert "missing_effective_date" in reason
+
+    gold_res = build_gold(
+        settings,
+        bronze_docs=silver_res.bronze_docs,
+        quarantined_docs=silver_res.quarantined_docs,
+        embed_fn=lambda texts: [[0.0] * 384 for _ in texts],
+    )
+    assert gold_res.manifest.gold_chunks == 0
+    assert gold_res.manifest.chunks_embedded == 0
+    assert gold_res.index_path.exists()

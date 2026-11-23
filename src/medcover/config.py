@@ -1,8 +1,9 @@
 """Typed runtime configuration for the MedCover pipeline and serving layer."""
 
 from pathlib import Path
+from typing import Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -57,19 +58,30 @@ class Settings(BaseSettings):
         """Directory holding staged Write-Audit-Publish release directories."""
         return self.data_dir / "releases"
 
+    @model_validator(mode="after")
+    def _validate_chunk_overlap(self) -> Self:
+        if self.chunk_token_overlap >= self.chunk_token_limit:
+            msg = (
+                f"chunk_token_overlap ({self.chunk_token_overlap}) must be less than "
+                f"chunk_token_limit ({self.chunk_token_limit})"
+            )
+            raise ValueError(msg)
+        return self
+
     def resolved_duckdb_extension_dir(self) -> Path | None:
         """Return explicit or workspace-local DuckDB extension cache directory when available."""
-        if self.duckdb_extension_dir is not None:
-            return self.duckdb_extension_dir
-        local_cache = Path(".cache/duckdb_extensions")
-        return local_cache if local_cache.exists() else None
+        return _resolve_cache_dir(self.duckdb_extension_dir, "duckdb_extensions")
 
     def resolved_fastembed_cache_dir(self) -> Path | None:
         """Return explicit or workspace-local FastEmbed cache directory when available."""
-        if self.fastembed_cache_dir is not None:
-            return self.fastembed_cache_dir
-        local_cache = Path(".cache/fastembed")
-        return local_cache if local_cache.exists() else None
+        return _resolve_cache_dir(self.fastembed_cache_dir, "fastembed")
+
+
+def _resolve_cache_dir(explicit: Path | None, subdir: str) -> Path | None:
+    if explicit is not None:
+        return explicit
+    local_cache = Path(".cache") / subdir
+    return local_cache if local_cache.exists() else None
 
 
 def get_settings() -> Settings:
@@ -79,11 +91,4 @@ def get_settings() -> Settings:
     Output grain: single validated ``Settings`` instance.
     Invariants: ``chunk_token_overlap`` is strictly smaller than ``chunk_token_limit``.
     """
-    settings = Settings()
-    if settings.chunk_token_overlap >= settings.chunk_token_limit:
-        msg = (
-            f"chunk_token_overlap ({settings.chunk_token_overlap}) must be less than "
-            f"chunk_token_limit ({settings.chunk_token_limit})"
-        )
-        raise ValueError(msg)
-    return settings
+    return Settings()

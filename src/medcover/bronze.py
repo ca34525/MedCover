@@ -8,44 +8,52 @@ import io
 import json
 import sys
 import zipfile
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from medcover.config import Settings
 from medcover.contracts import (
+    BRONZE_CROSSWALKS_ARROW_SCHEMA,
+    BRONZE_CROSSWALKS_SCHEMA,
+    BRONZE_DOCUMENTS_ARROW_SCHEMA,
+    BRONZE_DOCUMENTS_SCHEMA,
     SourceMode,
-    validate_bronze_crosswalks,
-    validate_bronze_documents,
+    parse_optional_date,
+    parse_optional_int,
+    parse_optional_str,
 )
 
 # CMS HTML policy cells can exceed the default 128 KB CSV field limit.
 csv.field_size_limit(min(sys.maxsize, 100_000_000))
 
-BRONZE_DOCUMENT_COLUMNS: tuple[str, ...] = (
-    "doc_id",
-    "doc_type",
-    "version",
-    "title",
-    "raw_html",
-    "mac_jurisdiction",
+_CMS_STATUS_MAP: dict[str, str] = {
+    "A": "ACTIVE",
+    "ACTIVE": "ACTIVE",
+    "CURRENT": "ACTIVE",
+    "R": "RETIRED",
+    "RETIRED": "RETIRED",
+}
+
+_EFFECTIVE_DATE_KEYS: tuple[str, ...] = (
     "effective_date",
-    "retired_date",
-    "status",
-    "source_mode",
-    "ingested_at",
-    "source_sha256",
+    "rev_eff_date",
+    "orig_det_eff_date",
+    "orig_eff_date",
+    "ncd_efctv_dt",
 )
 
-BRONZE_CROSSWALK_COLUMNS: tuple[str, ...] = (
-    "doc_id",
-    "version",
-    "code_system",
-    "code",
+_RETIRED_DATE_KEYS: tuple[str, ...] = (
+    "retired_date",
+    "ret_date",
+    "ent_det_end_date",
+    "rev_end_date",
+    "ncd_trmntn_dt",
 )
 
 
@@ -59,6 +67,107 @@ class BronzeResult:
     total_crosswalks: int
 
 
+@dataclass(frozen=True)
+class _CsvTableSpec:
+    kind: Literal["doc", "crosswalk"]
+    required_headers: frozenset[str]
+    marker_headers: frozenset[str]
+    id_columns: tuple[str, ...]
+    version_column: str
+    id_prefix: str = ""
+    allowed_prefixes: tuple[str, ...] = ()
+    doc_type: str | None = None
+    html_columns: tuple[str, ...] = ()
+    is_cms_native: bool = False
+
+
+_CSV_TABLE_SPECS: tuple[_CsvTableSpec, ...] = (
+    _CsvTableSpec(
+        kind="crosswalk",
+        required_headers=frozenset({"doc_id", "version", "code_system", "code"}),
+        marker_headers=frozenset(),
+        id_columns=("doc_id",),
+        version_column="version",
+    ),
+    _CsvTableSpec(
+        kind="crosswalk",
+        required_headers=frozenset({"lcd_id", "lcd_version"}),
+        marker_headers=frozenset({"hcpc_code_id", "icd10_code_id"}),
+        id_columns=("lcd_id",),
+        version_column="lcd_version",
+        id_prefix="L",
+        allowed_prefixes=("L", "DL"),
+        doc_type="LCD",
+        is_cms_native=True,
+    ),
+    _CsvTableSpec(
+        kind="crosswalk",
+        required_headers=frozenset({"article_id", "article_version"}),
+        marker_headers=frozenset({"hcpc_code_id", "icd10_code_id"}),
+        id_columns=("article_id",),
+        version_column="article_version",
+        id_prefix="A",
+        allowed_prefixes=("A", "DA"),
+        doc_type="ARTICLE",
+        is_cms_native=True,
+    ),
+    _CsvTableSpec(
+        kind="doc",
+        required_headers=frozenset({"doc_id"}),
+        marker_headers=frozenset({"raw_html", "title"}),
+        id_columns=("doc_id",),
+        version_column="version",
+    ),
+    _CsvTableSpec(
+        kind="doc",
+        required_headers=frozenset({"lcd_id", "lcd_version"}),
+        marker_headers=frozenset({"title", "indication", "raw_html"}),
+        id_columns=("lcd_id",),
+        version_column="lcd_version",
+        id_prefix="L",
+        allowed_prefixes=("L", "DL"),
+        doc_type="LCD",
+        html_columns=(
+            "indication",
+            "coding_guidelines",
+            "doc_reqs",
+            "summary_of_evidence",
+            "analysis_of_evidence",
+            "cms_cov_policy",
+            "util_guide",
+            "appendices",
+        ),
+        is_cms_native=True,
+    ),
+    _CsvTableSpec(
+        kind="doc",
+        required_headers=frozenset({"article_id", "article_version"}),
+        marker_headers=frozenset({"title", "description", "raw_html"}),
+        id_columns=("article_id",),
+        version_column="article_version",
+        id_prefix="A",
+        allowed_prefixes=("A", "DA"),
+        doc_type="ARTICLE",
+        html_columns=("description", "coding_guidelines", "other_comments"),
+        is_cms_native=True,
+    ),
+    _CsvTableSpec(
+        kind="doc",
+        required_headers=frozenset({"ncd_id", "ncd_vrsn_num"}),
+        marker_headers=frozenset(
+            {"ncd_mnl_sect_title", "title", "indctn_lmtn", "itm_srvc_desc", "raw_html"}
+        ),
+        id_columns=("ncd_mnl_sect", "ncd_id"),
+        version_column="ncd_vrsn_num",
+        id_prefix="NCD",
+        allowed_prefixes=("NCD",),
+        doc_type="NCD",
+        html_columns=("itm_srvc_desc", "indctn_lmtn"),
+        is_cms_native=True,
+    ),
+)
+
+
 def ingest_zip_or_dir(
     input_path: Path,
     bronze_dir: Path,
@@ -69,31 +178,36 @@ def ingest_zip_or_dir(
     Inputs: path to a ``.zip`` archive or directory containing CMS CSV/ZIP files, plus Bronze dir.
     Output grain: ``raw_documents.parquet`` unique on ``(doc_id, version)`` and
     ``raw_code_crosswalks.parquet`` code-link rows.
-    Invariants: preserves historical versions via upsert on ``(doc_id, version)`` and validates
-    output tables against Bronze Pandera schemas.
+    Invariants: preserves historical versions via upsert on ``(doc_id, version)``, scopes
+    crosswalk replacement to the document families whose crosswalk tables were ingested,
+    and validates output tables against Bronze Pandera contracts.
     """
     ingested_at = datetime.now(tz=UTC)
     documents: list[dict[str, Any]] = []
     crosswalks: list[dict[str, Any]] = []
     recognized_tables = 0
-    saw_crosswalk_table = False
+    replace_all_doc_crosswalks = False
+    refreshed_doc_types: set[str] = set()
 
     for csv_name, raw_bytes in _iter_csv_payloads(input_path):
         headers, rows = _parse_csv_bytes(raw_bytes)
         if not headers:
             continue
-        table_kind = _classify_csv_headers(headers)
-        if table_kind is None:
+        spec = _match_table_spec(headers)
+        if spec is None:
             continue
         recognized_tables += 1
-        if table_kind.endswith("_crosswalk"):
-            saw_crosswalk_table = True
-            crosswalks.extend(_normalize_crosswalk_rows(rows, table_kind=table_kind))
+        if spec.kind == "crosswalk":
+            if spec.doc_type is None:
+                replace_all_doc_crosswalks = True
+            else:
+                refreshed_doc_types.add(spec.doc_type)
+            crosswalks.extend(_normalize_crosswalk_rows(rows, spec=spec))
         else:
             documents.extend(
                 _normalize_document_rows(
                     rows,
-                    table_kind=table_kind,
+                    spec=spec,
                     source_mode=source_mode,
                     ingested_at=ingested_at,
                     csv_name=csv_name,
@@ -108,7 +222,8 @@ def ingest_zip_or_dir(
         documents=documents,
         crosswalks=crosswalks,
         bronze_dir=bronze_dir,
-        replace_doc_crosswalks=saw_crosswalk_table,
+        replace_doc_crosswalks=replace_all_doc_crosswalks,
+        refreshed_doc_types=refreshed_doc_types,
     )
 
 
@@ -118,55 +233,66 @@ def write_bronze_tables(
     bronze_dir: Path,
     *,
     replace_doc_crosswalks: bool = False,
+    refreshed_doc_types: Collection[str] | None = None,
 ) -> BronzeResult:
-    """Upsert normalized Bronze records into canonical Parquet files.
+    """Upsert normalized Bronze records into canonical typed Parquet files.
 
-    Inputs: iterable of Bronze document dicts and code crosswalk dicts, plus output directory.
+    Inputs: iterables of Bronze document dicts and code crosswalk dicts, plus output directory.
     Output grain: strictly 1 row per ``(doc_id, version)`` in ``raw_documents.parquet``.
-    Invariants: historical ``(doc_id, version)`` rows are retained; duplicate incoming keys
-    update only matching ``(doc_id, version)`` tuples, and refreshed versions replace prior
-    code crosswalk links rather than accumulating stale associations.
+    Invariants: historical ``(doc_id, version)`` rows are retained; refreshed versions replace
+    prior crosswalk links strictly for incoming crosswalk keys and matching ``refreshed_doc_types``.
     """
     bronze_dir.mkdir(parents=True, exist_ok=True)
     docs_path = bronze_dir / "raw_documents.parquet"
     codes_path = bronze_dir / "raw_code_crosswalks.parquet"
 
-    incoming_docs = _frame_with_columns(list(documents), BRONZE_DOCUMENT_COLUMNS)
+    incoming_docs = [_coerce_document_record(row) for row in documents]
+    docs_by_key: dict[tuple[str, int], dict[str, Any]] = {}
     if docs_path.exists():
-        existing_docs = pd.read_parquet(docs_path)
-        merged_docs = _upsert_documents(existing_docs, incoming_docs)
-    else:
-        merged_docs = _deduplicate_documents(incoming_docs)
+        for existing in pq.read_table(docs_path).to_pylist():
+            docs_by_key[(str(existing["doc_id"]), int(existing["version"]))] = existing
+    for doc in incoming_docs:
+        docs_by_key[(str(doc["doc_id"]), int(doc["version"]))] = doc
 
-    merged_docs = _coerce_bronze_document_types(merged_docs)
-    validate_bronze_documents(merged_docs)
-    merged_docs.to_parquet(docs_path, index=False)
+    merged_docs = [docs_by_key[key] for key in sorted(docs_by_key)]
+    docs_table = pa.Table.from_pylist(merged_docs, schema=BRONZE_DOCUMENTS_ARROW_SCHEMA)
+    BRONZE_DOCUMENTS_SCHEMA.validate(docs_table.to_pandas())
+    pq.write_table(docs_table, docs_path)
 
-    incoming_codes = _frame_with_columns(list(crosswalks), BRONZE_CROSSWALK_COLUMNS)
+    incoming_codes = [_coerce_crosswalk_record(row) for row in crosswalks]
+    refreshed_types = set(refreshed_doc_types) if refreshed_doc_types else set()
+    keys_to_replace: set[tuple[str, int]] = {
+        (str(row["doc_id"]), int(row["version"])) for row in incoming_codes
+    }
+    for doc in incoming_docs:
+        if replace_doc_crosswalks or (doc["doc_type"] in refreshed_types):
+            keys_to_replace.add((str(doc["doc_id"]), int(doc["version"])))
+
+    retained_codes: list[dict[str, Any]] = []
     if codes_path.exists():
-        existing_codes = pd.read_parquet(codes_path)
-        refreshed_doc_keys = (
-            set(zip(incoming_docs["doc_id"], incoming_docs["version"], strict=True))
-            if (replace_doc_crosswalks or not incoming_codes.empty) and not incoming_docs.empty
-            else set()
-        )
-        merged_codes = _upsert_crosswalks(
-            existing_codes,
-            incoming_codes,
-            refreshed_doc_keys=refreshed_doc_keys,
-        )
-    else:
-        merged_codes = incoming_codes
+        for existing_code in pq.read_table(codes_path).to_pylist():
+            key = (str(existing_code["doc_id"]), int(existing_code["version"]))
+            if key not in keys_to_replace:
+                retained_codes.append(existing_code)
 
-    merged_codes = _coerce_bronze_crosswalk_types(merged_codes)
-    validate_bronze_crosswalks(merged_codes)
-    merged_codes.to_parquet(codes_path, index=False)
+    merged_codes = sorted(
+        [*retained_codes, *incoming_codes],
+        key=lambda row: (
+            str(row["doc_id"]),
+            int(row["version"]),
+            str(row["code_system"]),
+            str(row["code"]),
+        ),
+    )
+    codes_table = pa.Table.from_pylist(merged_codes, schema=BRONZE_CROSSWALKS_ARROW_SCHEMA)
+    BRONZE_CROSSWALKS_SCHEMA.validate(codes_table.to_pandas())
+    pq.write_table(codes_table, codes_path)
 
     return BronzeResult(
         documents_path=docs_path,
         crosswalks_path=codes_path,
-        total_documents=len(merged_docs),
-        total_crosswalks=len(merged_codes),
+        total_documents=docs_table.num_rows,
+        total_crosswalks=codes_table.num_rows,
     )
 
 
@@ -192,7 +318,7 @@ def _iter_csv_payloads(input_path: Path) -> Iterator[tuple[str, bytes]]:
     if input_path.is_file():
         suffix = input_path.suffix.lower()
         if suffix == ".zip":
-            yield from _iter_zip_csv_bytes(input_path.read_bytes(), source_label=input_path.name)
+            yield from _iter_zip_csv_bytes(input_path, source_label=input_path.name)
             return
         if suffix == ".csv":
             yield input_path.name, input_path.read_bytes()
@@ -207,19 +333,23 @@ def _iter_csv_payloads(input_path: Path) -> Iterator[tuple[str, bytes]]:
         if suffix == ".csv":
             yield child.name, child.read_bytes()
         elif suffix == ".zip":
-            yield from _iter_zip_csv_bytes(child.read_bytes(), source_label=child.name)
+            yield from _iter_zip_csv_bytes(child, source_label=child.name)
 
 
-def _iter_zip_csv_bytes(zip_bytes: bytes, source_label: str) -> Iterator[tuple[str, bytes]]:
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
+def _iter_zip_csv_bytes(
+    zip_source: Path | io.BytesIO,
+    *,
+    source_label: str,
+) -> Iterator[tuple[str, bytes]]:
+    with zipfile.ZipFile(zip_source) as archive:
         for member in sorted(archive.namelist()):
             lower = member.lower()
             if member.endswith("/"):
                 continue
             if lower.endswith(".zip"):
-                nested_bytes = archive.read(member)
                 yield from _iter_zip_csv_bytes(
-                    nested_bytes, source_label=f"{source_label}!{member}"
+                    io.BytesIO(archive.read(member)),
+                    source_label=f"{source_label}!{member}",
                 )
             elif lower.endswith(".csv"):
                 yield f"{source_label}!{member}", archive.read(member)
@@ -236,79 +366,46 @@ def _parse_csv_bytes(raw_bytes: bytes) -> tuple[set[str], list[dict[str, str]]]:
     text = _decode_csv_bytes(raw_bytes)
     reader = csv.DictReader(io.StringIO(text, newline=""))
     headers = {name.strip().lower() for name in (reader.fieldnames or []) if name is not None}
-    return headers, [dict(row) for row in reader]
+    return headers, list(reader)
 
 
-def _classify_csv_headers(headers: set[str]) -> str | None:
-    if {"doc_id", "version", "code_system", "code"}.issubset(headers):
-        return "canonical_crosswalk"
-    if {"lcd_id", "lcd_version"}.issubset(headers) and (
-        "hcpc_code_id" in headers or "icd10_code_id" in headers
-    ):
-        return "cms_lcd_crosswalk"
-    if {"article_id", "article_version"}.issubset(headers) and (
-        "hcpc_code_id" in headers or "icd10_code_id" in headers
-    ):
-        return "cms_article_crosswalk"
-    if "doc_id" in headers and ("raw_html" in headers or "title" in headers):
-        return "canonical_doc"
-    if {"lcd_id", "lcd_version"}.issubset(headers) and bool(
-        headers & {"title", "indication", "raw_html"}
-    ):
-        return "cms_lcd_doc"
-    if {"article_id", "article_version"}.issubset(headers) and bool(
-        headers & {"title", "description", "raw_html"}
-    ):
-        return "cms_article_doc"
-    if {"ncd_id", "ncd_vrsn_num"}.issubset(headers) and bool(
-        headers & {"ncd_mnl_sect_title", "title", "indctn_lmtn", "itm_srvc_desc", "raw_html"}
-    ):
-        return "cms_ncd_doc"
+def _match_table_spec(headers: set[str]) -> _CsvTableSpec | None:
+    for spec in _CSV_TABLE_SPECS:
+        if spec.required_headers.issubset(headers) and (
+            not spec.marker_headers or bool(headers & spec.marker_headers)
+        ):
+            return spec
     return None
 
 
-def _clean_optional_str(value: Any) -> str | None:
-    if value is None or value is pd.NaT:
-        return None
-    if isinstance(value, float) and pd.isna(value):
-        return None
-    text = str(value).strip()
-    return text if text else None
-
-
-_CMS_DATE_FORMATS: tuple[str, ...] = (
-    "%Y-%m-%d",
-    "%m/%d/%Y",
-    "%Y-%m-%d %H:%M:%S",
-    "%m/%d/%Y %H:%M:%S",
-    "%m/%d/%Y %I:%M:%S %p",
-)
-
-
-def _parse_optional_date(value: Any) -> date | None:
-    if value is None or value is pd.NaT:
-        return None
-    if isinstance(value, float) and pd.isna(value):
-        return None
-    if isinstance(value, pd.Timestamp):
-        return None if bool(pd.isna(value)) else value.date()
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    text = _clean_optional_str(value)
-    if text is None:
-        return None
-    try:
-        return date.fromisoformat(text[:10])
-    except ValueError:
-        pass
-    for fmt in _CMS_DATE_FORMATS:
-        try:
-            return datetime.strptime(text, fmt).date()
-        except ValueError:
-            continue
+def _first_present(row: Mapping[str, str], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = parse_optional_str(row.get(key))
+        if value is not None:
+            return value
     return None
+
+
+def _extract_identity(
+    lowered: Mapping[str, str],
+    spec: _CsvTableSpec,
+) -> tuple[str | None, int | None, str | None]:
+    raw_id = _first_present(lowered, spec.id_columns)
+    if raw_id is None:
+        doc_id: str | None = None
+    elif spec.id_prefix:
+        upper = raw_id.upper()
+        doc_id = upper if upper.startswith(spec.allowed_prefixes) else f"{spec.id_prefix}{upper}"
+    else:
+        doc_id = raw_id
+
+    version = parse_optional_int(lowered.get(spec.version_column))
+    if spec.doc_type is not None:
+        doc_type: str | None = spec.doc_type
+    else:
+        raw_type = parse_optional_str(lowered.get("doc_type"))
+        doc_type = raw_type.upper() if raw_type else None
+    return doc_id, version, doc_type
 
 
 def _compute_source_sha256(record: Mapping[str, Any]) -> str:
@@ -335,73 +432,10 @@ def _compute_source_sha256(record: Mapping[str, Any]) -> str:
     return hashlib.sha256(serialized).hexdigest()
 
 
-_CMS_HTML_COLUMNS: dict[str, tuple[str, ...]] = {
-    "cms_lcd_doc": (
-        "indication",
-        "coding_guidelines",
-        "doc_reqs",
-        "summary_of_evidence",
-        "analysis_of_evidence",
-        "cms_cov_policy",
-        "util_guide",
-        "appendices",
-    ),
-    "cms_article_doc": ("description", "coding_guidelines", "other_comments"),
-    "cms_ncd_doc": ("itm_srvc_desc", "indctn_lmtn"),
-}
-
-_CMS_STATUS_MAP: dict[str, str] = {
-    "A": "ACTIVE",
-    "ACTIVE": "ACTIVE",
-    "CURRENT": "ACTIVE",
-    "R": "RETIRED",
-    "RETIRED": "RETIRED",
-}
-
-
-def _first_present(row: Mapping[str, str], keys: tuple[str, ...]) -> str | None:
-    for key in keys:
-        value = _clean_optional_str(row.get(key))
-        if value is not None:
-            return value
-    return None
-
-
-def _prefix_cms_id(raw_id: str, *, prefix: str, allowed_prefixes: tuple[str, ...]) -> str:
-    upper = raw_id.upper()
-    return upper if upper.startswith(allowed_prefixes) else f"{prefix}{upper}"
-
-
-def _extract_doc_identity(
-    lowered: Mapping[str, str], *, table_kind: str
-) -> tuple[str | None, str | None, str | None]:
-    if table_kind == "cms_lcd_doc":
-        raw_id = _clean_optional_str(lowered.get("lcd_id"))
-        doc_id = (
-            _prefix_cms_id(raw_id, prefix="L", allowed_prefixes=("L", "DL")) if raw_id else None
-        )
-        return doc_id, _clean_optional_str(lowered.get("lcd_version")), "LCD"
-    if table_kind == "cms_article_doc":
-        raw_id = _clean_optional_str(lowered.get("article_id"))
-        doc_id = (
-            _prefix_cms_id(raw_id, prefix="A", allowed_prefixes=("A", "DA")) if raw_id else None
-        )
-        return doc_id, _clean_optional_str(lowered.get("article_version")), "ARTICLE"
-    if table_kind == "cms_ncd_doc":
-        raw_id = _first_present(lowered, ("ncd_mnl_sect", "ncd_id"))
-        doc_id = _prefix_cms_id(raw_id, prefix="NCD", allowed_prefixes=("NCD",)) if raw_id else None
-        return doc_id, _clean_optional_str(lowered.get("ncd_vrsn_num")), "NCD"
-    doc_type = _clean_optional_str(lowered.get("doc_type"))
-    return (
-        _clean_optional_str(lowered.get("doc_id")),
-        _clean_optional_str(lowered.get("version")),
-        doc_type.upper() if doc_type else None,
-    )
-
-
 def _normalize_document_rows(
     rows: Iterable[Mapping[str, str]],
-    table_kind: str,
+    *,
+    spec: _CsvTableSpec,
     source_mode: SourceMode,
     ingested_at: datetime,
     csv_name: str,
@@ -409,48 +443,31 @@ def _normalize_document_rows(
     normalized: list[dict[str, Any]] = []
     for row in rows:
         lowered = {k.strip().lower(): v for k, v in row.items() if k is not None}
-        doc_id, raw_version, doc_type = _extract_doc_identity(lowered, table_kind=table_kind)
+        doc_id, version, doc_type = _extract_identity(lowered, spec)
         if doc_id is None:
             msg = f"Missing doc_id in Bronze source {csv_name}"
             raise ValueError(msg)
-        if raw_version is None:
-            msg = f"Missing version for doc_id={doc_id} in {csv_name}"
+        if version is None:
+            msg = f"Missing or invalid version for doc_id={doc_id} in {csv_name}"
             raise ValueError(msg)
-        version = int(raw_version)
 
         if "raw_html" in lowered:
-            raw_html: str | None = lowered.get("raw_html")
+            raw_html = parse_optional_str(lowered.get("raw_html"))
         else:
             parts = [
                 part
-                for col in _CMS_HTML_COLUMNS.get(table_kind, ())
-                if (part := _clean_optional_str(lowered.get(col))) is not None
+                for col in spec.html_columns
+                if (part := parse_optional_str(lowered.get(col))) is not None
             ]
             raw_html = "\n".join(parts) if parts else None
 
-        effective_date = _parse_optional_date(
-            _first_present(
-                lowered,
-                (
-                    "effective_date",
-                    "rev_eff_date",
-                    "orig_det_eff_date",
-                    "orig_eff_date",
-                    "ncd_efctv_dt",
-                ),
-            )
-        )
-        retired_date = _parse_optional_date(
-            _first_present(
-                lowered,
-                ("retired_date", "ret_date", "ent_det_end_date", "rev_end_date", "ncd_trmntn_dt"),
-            )
-        )
+        effective_date = parse_optional_date(_first_present(lowered, _EFFECTIVE_DATE_KEYS))
+        retired_date = parse_optional_date(_first_present(lowered, _RETIRED_DATE_KEYS))
 
-        raw_status = _clean_optional_str(lowered.get("status"))
+        raw_status = parse_optional_str(lowered.get("status"))
         if raw_status is not None:
             status: str | None = _CMS_STATUS_MAP.get(raw_status.upper(), raw_status.upper())
-        elif table_kind.startswith("cms_"):
+        elif spec.is_cms_native:
             status = "RETIRED" if retired_date is not None else "ACTIVE"
         else:
             status = None
@@ -476,44 +493,30 @@ def _normalize_document_rows(
 def _normalize_crosswalk_rows(
     rows: Iterable[Mapping[str, str]],
     *,
-    table_kind: str = "canonical_crosswalk",
+    spec: _CsvTableSpec,
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for row in rows:
         lowered = {k.strip().lower(): v for k, v in row.items() if k is not None}
-        if table_kind == "cms_lcd_crosswalk":
-            raw_id = _clean_optional_str(lowered.get("lcd_id"))
-            doc_id = (
-                _prefix_cms_id(raw_id, prefix="L", allowed_prefixes=("L", "DL")) if raw_id else None
-            )
-            raw_version = _clean_optional_str(lowered.get("lcd_version"))
-        elif table_kind == "cms_article_crosswalk":
-            raw_id = _clean_optional_str(lowered.get("article_id"))
-            doc_id = (
-                _prefix_cms_id(raw_id, prefix="A", allowed_prefixes=("A", "DA")) if raw_id else None
-            )
-            raw_version = _clean_optional_str(lowered.get("article_version"))
-        else:
-            doc_id = _clean_optional_str(lowered.get("doc_id"))
-            raw_version = _clean_optional_str(lowered.get("version"))
+        doc_id, version, _ = _extract_identity(lowered, spec)
 
-        if table_kind == "canonical_crosswalk":
-            code_system = _clean_optional_str(lowered.get("code_system"))
-            code = _clean_optional_str(lowered.get("code"))
-        elif (code := _clean_optional_str(lowered.get("hcpc_code_id"))) is not None:
+        if not spec.is_cms_native:
+            code_system = parse_optional_str(lowered.get("code_system"))
+            code = parse_optional_str(lowered.get("code"))
+        elif (code := parse_optional_str(lowered.get("hcpc_code_id"))) is not None:
             code_system = "CPT" if code.isdigit() and len(code) == 5 else "HCPCS"
-        elif (code := _clean_optional_str(lowered.get("icd10_code_id"))) is not None:
+        elif (code := parse_optional_str(lowered.get("icd10_code_id"))) is not None:
             code_system = "ICD10"
         else:
             code_system = None
             code = None
 
-        if not (doc_id and raw_version and code_system and code):
+        if not (doc_id and version is not None and code_system and code):
             continue
         normalized.append(
             {
                 "doc_id": doc_id,
-                "version": int(raw_version),
+                "version": version,
                 "code_system": code_system.upper(),
                 "code": code.upper(),
             }
@@ -521,76 +524,51 @@ def _normalize_crosswalk_rows(
     return normalized
 
 
-def _frame_with_columns(
-    rows: Sequence[Mapping[str, Any]],
-    columns: tuple[str, ...],
-) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame(columns=list(columns))
-    return pd.DataFrame([dict(row) for row in rows]).reindex(columns=list(columns))
+def _coerce_document_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    doc_id = parse_optional_str(row.get("doc_id"))
+    version = parse_optional_int(row.get("version"))
+    if doc_id is None or version is None:
+        msg = f"Bronze document requires non-null doc_id and integer version: {row!r}"
+        raise ValueError(msg)
+
+    raw_ingested = row.get("ingested_at")
+    if isinstance(raw_ingested, datetime):
+        ingested_at = (
+            raw_ingested if raw_ingested.tzinfo is not None else raw_ingested.replace(tzinfo=UTC)
+        )
+    else:
+        ingested_at = datetime.now(tz=UTC)
+
+    record: dict[str, Any] = {
+        "doc_id": doc_id,
+        "doc_type": parse_optional_str(row.get("doc_type")),
+        "version": version,
+        "title": parse_optional_str(row.get("title")),
+        "raw_html": parse_optional_str(row.get("raw_html")),
+        "mac_jurisdiction": parse_optional_str(row.get("mac_jurisdiction")),
+        "effective_date": parse_optional_date(row.get("effective_date")),
+        "retired_date": parse_optional_date(row.get("retired_date")),
+        "status": parse_optional_str(row.get("status")),
+        "source_mode": parse_optional_str(row.get("source_mode")) or "zip",
+        "ingested_at": ingested_at,
+    }
+    record["source_sha256"] = parse_optional_str(row.get("source_sha256")) or (
+        _compute_source_sha256(record)
+    )
+    return record
 
 
-def _deduplicate_documents(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    return df.drop_duplicates(subset=["doc_id", "version"], keep="last").reset_index(drop=True)
-
-
-def _upsert_documents(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
-    if existing.empty:
-        return _deduplicate_documents(incoming)
-    if incoming.empty:
-        return _deduplicate_documents(existing)
-    combined = pd.concat([existing, incoming], ignore_index=True)
-    return _deduplicate_documents(combined)
-
-
-def _upsert_crosswalks(
-    existing: pd.DataFrame,
-    incoming: pd.DataFrame,
-    *,
-    refreshed_doc_keys: set[tuple[Any, Any]],
-) -> pd.DataFrame:
-    if existing.empty:
-        return incoming
-    keys_to_replace = set(refreshed_doc_keys)
-    if not incoming.empty:
-        keys_to_replace.update(zip(incoming["doc_id"], incoming["version"], strict=True))
-    if not keys_to_replace:
-        return existing
-    keep_mask = [
-        (doc_id, version) not in keys_to_replace
-        for doc_id, version in zip(existing["doc_id"], existing["version"], strict=True)
-    ]
-    retained = existing.loc[keep_mask]
-    if incoming.empty:
-        return retained.reset_index(drop=True)
-    if retained.empty:
-        return incoming.reset_index(drop=True)
-    return pd.concat([retained, incoming], ignore_index=True)
-
-
-def _coerce_bronze_document_types(df: pd.DataFrame) -> pd.DataFrame:
-    result = df.copy()
-    if result.empty:
-        for col in ("doc_id", "source_mode", "source_sha256"):
-            result[col] = pd.Series(dtype="string")
-        result["version"] = pd.Series(dtype="int64")
-        return result
-    result["version"] = result["version"].astype("int64")
-    result["effective_date"] = result["effective_date"].map(_parse_optional_date)
-    result["retired_date"] = result["retired_date"].map(_parse_optional_date)
-    result = result.sort_values(["doc_id", "version"]).reset_index(drop=True)
-    return result
-
-
-def _coerce_bronze_crosswalk_types(df: pd.DataFrame) -> pd.DataFrame:
-    result = df.copy()
-    if result.empty:
-        for col in ("doc_id", "code_system", "code"):
-            result[col] = pd.Series(dtype="string")
-        result["version"] = pd.Series(dtype="int64")
-        return result
-    result["version"] = result["version"].astype("int64")
-    result = result.sort_values(["doc_id", "version", "code_system", "code"]).reset_index(drop=True)
-    return result
+def _coerce_crosswalk_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    doc_id = parse_optional_str(row.get("doc_id"))
+    version = parse_optional_int(row.get("version"))
+    code_system = parse_optional_str(row.get("code_system"))
+    code = parse_optional_str(row.get("code"))
+    if not (doc_id and version is not None and code_system and code):
+        msg = f"Bronze crosswalk requires doc_id, version, code_system, and code: {row!r}"
+        raise ValueError(msg)
+    return {
+        "doc_id": doc_id,
+        "version": version,
+        "code_system": code_system.upper(),
+        "code": code.upper(),
+    }

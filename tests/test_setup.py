@@ -32,7 +32,10 @@ def test_settings_defaults_and_medallion_paths() -> None:
 
 
 def test_settings_rejects_overlap_gte_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify invalid chunk overlap configuration fails fast."""
+    """Verify invalid chunk overlap configuration fails fast via both Settings and get_settings."""
+    with pytest.raises(ValueError, match="chunk_token_overlap"):
+        Settings(chunk_token_limit=100, chunk_token_overlap=100)
+
     monkeypatch.setenv("MEDCOVER_CHUNK_TOKEN_LIMIT", "100")
     monkeypatch.setenv("MEDCOVER_CHUNK_TOKEN_OVERLAP", "100")
     with pytest.raises(ValueError, match="chunk_token_overlap"):

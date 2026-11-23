@@ -134,3 +134,40 @@ def test_cms_bulk_lcd_columns_dates_and_unrecognized_archive(tmp_path: Path) -> 
     unknown_csv.write_text("foo,bar\n1,2\n", encoding="utf-8")
     with pytest.raises(ValueError, match="No recognized CMS policy"):
         ingest_zip_or_dir(unknown_csv, tmp_path / "bronze_empty")
+
+
+def test_bronze_partial_bundle_preserves_other_family_crosswalks_and_rejects_garbage_dates(
+    tmp_path: Path,
+) -> None:
+    """Verify LCD crosswalk updates keep NCD codes and trailing garbage dates parse to None."""
+    settings = Settings(data_dir=tmp_path)
+    ingest_sample_fixtures(settings)
+
+    partial_dir = tmp_path / "partial_bundle"
+    partial_dir.mkdir()
+    (partial_dir / "lcd.csv").write_text(
+        "lcd_id,lcd_version,title,indication,orig_det_eff_date,ret_date,status\n"
+        '35399,1,Trailing Garbage Date,"<p>Body</p>",2024-01-15garbage,,A\n',
+        encoding="utf-8",
+    )
+    (partial_dir / "ncd.csv").write_text(
+        "ncd_id,ncd_mnl_sect,ncd_vrsn_num,ncd_mnl_sect_title,itm_srvc_desc,ncd_efctv_dt\n"
+        '220,220.6,2,PET Scans Updated,"<p>Updated NCD body</p>",2013-06-11\n',
+        encoding="utf-8",
+    )
+    (partial_dir / "lcd_x_hcpc_code.csv").write_text(
+        "lcd_id,lcd_version,hcpc_code_id\n35399,1,72148\n",
+        encoding="utf-8",
+    )
+
+    ingest_zip_or_dir(partial_dir, settings.bronze_dir)
+    docs_df = pd.read_parquet(settings.bronze_dir / "raw_documents.parquet")
+    codes_df = pd.read_parquet(settings.bronze_dir / "raw_code_crosswalks.parquet")
+
+    l35399 = docs_df[docs_df["doc_id"] == "L35399"].iloc[0]
+    assert pd.isna(l35399["effective_date"])
+
+    ncd_codes = codes_df[(codes_df["doc_id"] == "NCD220.6") & (codes_df["version"] == 2)]
+    assert set(ncd_codes["code"]) >= {"78815", "78816", "C34.90"}
+    l35399_codes = codes_df[(codes_df["doc_id"] == "L35399") & (codes_df["version"] == 1)]
+    assert list(l35399_codes["code"]) == ["72148"]

@@ -9,7 +9,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from medcover.bronze import ingest_sample_fixtures
+from medcover.bronze import ingest_sample_fixtures, ingest_zip_or_dir
 from medcover.config import Settings
 from medcover.gold import build_gold, chunk_markdown
 from medcover.silver import build_silver
@@ -52,6 +52,47 @@ def test_chunk_markdown_does_not_duplicate_overlap_on_long_paragraph() -> None:
     assert chunks[0].token_count == 450
     assert chunks[1].token_count == 61
     assert chunks[1].chunk_text.split() == words[390:451]
+
+
+def test_chunk_markdown_mixed_prose_and_table_never_corrupts_table_overlap() -> None:
+    """Verify a chunk ending with a Markdown table never leaks pipe fragments into overlap."""
+    intro = " ".join(f"intro{i}" for i in range(15))
+    table = "| Code | Rule |\n| --- | --- |\n| 72148 | six weeks |\n| 72149 | contrast |"
+    after = " ".join(f"after{i}" for i in range(40))
+    md = f"## Criteria\n\n{intro}\n\n{table}\n\n{after}"
+
+    chunks = chunk_markdown(md, default_heading="Test", token_limit=55, token_overlap=15)
+    assert len(chunks) == 2
+    assert "| 72148 | six weeks |" in chunks[0].chunk_text
+    assert "|" not in chunks[1].chunk_text
+    assert chunks[1].chunk_text.startswith("after0")
+
+
+def test_gold_deduplicates_intra_build_chunks_and_derives_api_source_mode(tmp_path: Path) -> None:
+    """Verify identical sections embed once per build and inherit api source_mode."""
+    api_csv = tmp_path / "api_versions.csv"
+    body = '"<h2>Criteria</h2><p>Identical text.</p>"'
+    api_csv.write_text(
+        "doc_id,doc_type,version,title,mac_jurisdiction,effective_date,retired_date,status,raw_html\n"
+        f"L55555,LCD,1,Shared Policy,Novitas,2023-01-01,,ACTIVE,{body}\n"
+        f"L55555,LCD,2,Shared Policy,Novitas,2024-01-01,,ACTIVE,{body}\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(data_dir=tmp_path)
+    ingest_zip_or_dir(api_csv, settings.bronze_dir, source_mode="api")
+    silver_res = build_silver(settings)
+    gold_res = build_gold(
+        settings,
+        bronze_docs=silver_res.bronze_docs,
+        quarantined_docs=silver_res.quarantined_docs,
+        embed_fn=_deterministic_embed,
+    )
+
+    assert gold_res.manifest.source_mode == "api"
+    assert gold_res.manifest.gold_chunks == 2
+    assert gold_res.manifest.chunks_embedded == 1
+    assert gold_res.manifest.chunks_reused == 1
 
 
 def test_gold_idempotency_and_delta_reembed(tmp_path: Path) -> None:

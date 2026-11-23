@@ -1,4 +1,4 @@
-.PHONY: install check lint format typecheck sql-lint test build-sample eval smoke
+.PHONY: install check lint format typecheck sql-lint test build-sample eval eval-sample smoke
 
 install:
 	uv sync
@@ -28,4 +28,7 @@ build-sample:
 eval:
 	uv run medcover eval
 
-smoke: build-sample eval
+eval-sample:
+	uv run medcover eval --sample
+
+smoke: build-sample eval-sample
