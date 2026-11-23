@@ -9,7 +9,9 @@ from pathlib import Path
 
 from medcover.bronze import ingest_sample_fixtures, ingest_zip_or_dir
 from medcover.config import get_settings
+from medcover.eval import evaluate_retrieval
 from medcover.gold import build_gold
+from medcover.retrieve import RetrieveRequest, retrieve_chunks
 from medcover.silver import build_silver
 
 
@@ -68,6 +70,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include retired policies in search results.",
     )
+    query.add_argument("--cpt", dest="cpt_code", default=None, help="Filter by CPT/HCPCS code.")
+    query.add_argument("--icd10", dest="icd10_code", default=None, help="Filter by ICD-10 code.")
+    query.add_argument(
+        "--doc-type",
+        dest="doc_type",
+        default=None,
+        help="Filter by document type (NCD, LCD, or ARTICLE).",
+    )
+    query.add_argument(
+        "--mac",
+        dest="mac_jurisdiction",
+        default=None,
+        help="Filter by MAC jurisdiction.",
+    )
+    query.add_argument(
+        "--sample",
+        action="store_true",
+        help="Query isolated sample build artifacts.",
+    )
 
     eval_cmd = subparsers.add_parser(
         "eval",
@@ -86,7 +107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch CLI subcommands.
 
     Inputs: optional argument list (defaults to ``sys.argv[1:]``).
-    Output grain: process exit code (0 on success).
+    Output grain: process exit code (0 on success, non-zero on gate failure).
     Invariants: keeps CLI wiring thin; stage logic lives in dedicated modules.
     """
     parser = build_parser()
@@ -119,6 +140,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(json.dumps(gold_res.manifest.model_dump(mode="json"), indent=2))
         return 0
+
+    if args.command == "query":
+        if args.sample:
+            settings = settings.model_copy(update={"data_dir": settings.data_dir / "sample"})
+        request = RetrieveRequest(
+            query=args.text,
+            top_k=args.top_k,
+            active_only=not args.include_retired,
+            cpt_code=args.cpt_code,
+            icd10_code=args.icd10_code,
+            doc_type=args.doc_type,
+            mac_jurisdiction=args.mac_jurisdiction,
+        )
+        response = retrieve_chunks(request, settings=settings)
+        print(json.dumps(response.model_dump(mode="json"), indent=2))
+        return 0
+
+    if args.command == "eval":
+        if args.sample:
+            settings = settings.model_copy(update={"data_dir": settings.data_dir / "sample"})
+        report = evaluate_retrieval(settings)
+        print(json.dumps(report.model_dump(mode="json"), indent=2))
+        return 0 if report.passed else 1
 
     msg = f"Subcommand '{args.command}' is not implemented yet."
     raise NotImplementedError(msg)
