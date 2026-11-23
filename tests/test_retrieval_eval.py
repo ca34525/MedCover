@@ -10,7 +10,6 @@ from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
-import duckdb
 import httpx
 import pytest
 import respx
@@ -18,9 +17,9 @@ import respx
 from medcover import cli, gold, retrieve
 from medcover.bronze import ingest_sample_fixtures
 from medcover.config import Settings
-from medcover.contracts import RunManifest
-from medcover.eval import evaluate_retrieval
+from medcover.eval import EvalReport, evaluate_retrieval
 from medcover.gold import build_gold
+from medcover.quality import audit_medallion, render_manifest_summary
 from medcover.retrieve import (
     HybridRetriever,
     RetrievedChunk,
@@ -64,8 +63,10 @@ def _build_sample_index(tmp_path: Path) -> Settings:
     return settings
 
 
-def test_hybrid_retrieval_filters_active_codes_type_and_mac(tmp_path: Path) -> None:
-    """Verify RRF search enforces active_only, CPT/ICD-10 arrays, doc_type, and MAC filters."""
+def test_hybrid_retrieval_filters_as_of_date_codes_type_and_mac_with_ncds(
+    tmp_path: Path,
+) -> None:
+    """Verify RRF search enforces point-in-time dates, HCPCS/ICD-10 arrays, doc_type, and MAC."""
     settings = _build_sample_index(tmp_path)
     retriever = HybridRetriever(
         settings.gold_dir / "index.duckdb",
@@ -73,33 +74,59 @@ def test_hybrid_retrieval_filters_active_codes_type_and_mac(tmp_path: Path) -> N
         embed_fn=_hashed_bow_embed,
     )
 
-    # Active-only search must never leak retired LCD L33381.
-    active_bariatric = retriever.search(
+    # Current as_of_date must exclude retired LCD L33381 (retired 2024-06-30).
+    current_bariatric = retriever.search(
         RetrieveRequest(
             query="Roux-en-Y gastric bypass bariatric surgery morbid obesity",
-            active_only=True,
+            as_of_date=date(2026, 1, 1),
         )
     )
-    assert all(chunk.is_active for chunk in active_bariatric.chunks)
-    assert "L33381" not in {chunk.doc_id for chunk in active_bariatric.chunks}
+    assert "L33381" not in {chunk.doc_id for chunk in current_bariatric.chunks}
+    assert all(
+        chunk.effective_date <= date(2026, 1, 1)
+        and (chunk.retired_date is None or chunk.retired_date > date(2026, 1, 1))
+        for chunk in current_bariatric.chunks
+    )
 
-    # Explicit historical lookup with active_only=False returns retired L33381.
-    retired_bariatric = retriever.search(
+    # Point-in-time lookup before retirement recovers L33381 and excludes post-dated LCDs.
+    historical_bariatric = retriever.search(
         RetrieveRequest(
             query="Roux-en-Y gastric bypass bariatric surgery 43644",
-            active_only=False,
-            cpt_code="43644",
+            as_of_date=date(2023, 6, 1),
+            hcpcs_code="43644",
         )
     )
-    assert retired_bariatric.total_hits > 0
-    assert retired_bariatric.chunks[0].doc_id == "L33381"
-    assert retired_bariatric.chunks[0].is_active is False
+    assert len(historical_bariatric.chunks) > 0
+    assert historical_bariatric.chunks[0].doc_id == "L33381"
+    assert historical_bariatric.chunks[0].retired_date == date(2024, 6, 30)
 
-    # Case-insensitive CPT + ICD-10 filter scopes to lumbar spine MRI pair.
+    # A date prior to L34998's 2024-01-15 effective_date must exclude L34998.
+    before_moldx = retriever.search(
+        RetrieveRequest(
+            query="MolDX NGS panel EGFR ALK non-small cell lung cancer",
+            as_of_date=date(2023, 12, 31),
+            hcpcs_code="81445",
+        )
+    )
+    assert before_moldx.chunks == []
+
+    # as_of_date=None disables temporal filtering and returns retired L33381.
+    all_dates_bariatric = retriever.search(
+        RetrieveRequest(
+            query="Roux-en-Y gastric bypass bariatric surgery 43644",
+            as_of_date=None,
+            hcpcs_code="43644",
+        )
+    )
+    assert len(all_dates_bariatric.chunks) > 0
+    assert all_dates_bariatric.chunks[0].doc_id == "L33381"
+
+    # Case-insensitive HCPCS + ICD-10 filter scopes to lumbar spine MRI pair.
     mri_pair = retriever.search(
         RetrieveRequest(
             query="lumbar spine MRI radiculopathy",
-            cpt_code="72148",
+            as_of_date=date(2026, 1, 1),
+            hcpcs_code="72148",
             icd10_code="m51.16",
         )
     )
@@ -109,85 +136,131 @@ def test_hybrid_retrieval_filters_active_codes_type_and_mac(tmp_path: Path) -> N
     mri_lcd_only = retriever.search(
         RetrieveRequest(
             query="lumbar spine MRI radiculopathy",
-            cpt_code="72148",
+            as_of_date=date(2026, 1, 1),
+            hcpcs_code="72148",
             doc_type="LCD",
         )
     )
     assert {chunk.doc_id for chunk in mri_lcd_only.chunks} == {"L33822"}
 
-    # Case-insensitive MAC jurisdiction filter scopes to First Coast cataract LCD.
+    # MAC jurisdiction filter returns that MAC's policies plus nationwide NCDs, never other MACs.
     cataract_mac = retriever.search(
         RetrieveRequest(
             query="cataract surgery functional impairment",
+            as_of_date=date(2026, 1, 1),
             mac_jurisdiction="first coast service options (jn)",
         )
     )
-    assert {chunk.doc_id for chunk in cataract_mac.chunks} == {"L35041"}
+    assert cataract_mac.chunks[0].doc_id == "L35041"
+    assert all(
+        chunk.doc_type == "NCD"
+        or (chunk.mac_jurisdiction or "").lower() == "first coast service options (jn)"
+        for chunk in cataract_mac.chunks
+    )
+
+    # Nationwide NCDs remain discoverable when filtering by a regional MAC.
+    pet_in_novitas = retriever.search(
+        RetrieveRequest(
+            query="FDG PET scans non-small cell lung cancer",
+            as_of_date=date(2026, 1, 1),
+            mac_jurisdiction="Novitas Solutions (JH/JL)",
+        )
+    )
+    assert pet_in_novitas.chunks[0].doc_id == "NCD220.6"
+
+    # Combining mac_jurisdiction + doc_type="LCD" restricts strictly to that MAC's local LCDs.
+    cataract_lcd_only = retriever.search(
+        RetrieveRequest(
+            query="cataract surgery functional impairment",
+            as_of_date=date(2026, 1, 1),
+            mac_jurisdiction="First Coast Service Options (JN)",
+            doc_type="LCD",
+        )
+    )
+    assert {chunk.doc_id for chunk in cataract_lcd_only.chunks} == {"L35041"}
 
 
-def test_hybrid_retrieval_handles_zero_vectors_and_runtime_retired_date(tmp_path: Path) -> None:
-    """Verify NaN cosine distances degrade to BM25 and past retired_date is excluded at runtime."""
+def test_hybrid_retrieval_handles_zero_vectors_and_retirement_boundary(tmp_path: Path) -> None:
+    """Verify NaN cosine distances degrade to BM25 and exact retired_date is excluded."""
     settings = Settings(data_dir=tmp_path)
     ingest_sample_fixtures(settings)
     silver_res = build_silver(settings)
-    gold_res = build_gold(
+    build_gold(
         settings,
         bronze_docs=silver_res.bronze_docs,
         quarantined_docs=silver_res.quarantined_docs,
         embed_fn=lambda texts: [[0.0] * 384 for _ in texts],
     )
 
-    # Simulate an index whose is_active flag went stale after a policy's retired_date passed.
-    config: dict[str, str] = {}
-    ext_dir = settings.resolved_duckdb_extension_dir()
-    if ext_dir is not None:
-        config["extension_directory"] = str(ext_dir.resolve())
-    with duckdb.connect(str(gold_res.index_path), config=config) as con:
-        con.execute("UPDATE chunks SET is_active = TRUE WHERE doc_id = 'L33381'")
-
-    res = retrieve_chunks(
-        RetrieveRequest(query="Roux-en-Y gastric bypass bariatric surgery", active_only=True),
+    # Half-open [effective_date, retired_date): L33381 (retired 2024-06-30) is excluded on that day.
+    on_retire_day = retrieve_chunks(
+        RetrieveRequest(
+            query="Roux-en-Y gastric bypass bariatric surgery",
+            as_of_date=date(2024, 6, 30),
+        ),
         settings=settings,
         embed_fn=lambda texts: [[0.0] * 384 for _ in texts],
     )
-    assert "L33381" not in {chunk.doc_id for chunk in res.chunks}
+    assert "L33381" not in {chunk.doc_id for chunk in on_retire_day.chunks}
+
+    day_before_retire = retrieve_chunks(
+        RetrieveRequest(
+            query="Roux-en-Y gastric bypass bariatric surgery",
+            as_of_date=date(2024, 6, 29),
+        ),
+        settings=settings,
+        embed_fn=lambda texts: [[0.0] * 384 for _ in texts],
+    )
+    assert "L33381" in {chunk.doc_id for chunk in day_before_retire.chunks}
 
     mri = retrieve_chunks(
-        RetrieveRequest(query="lumbar spine MRI radiculopathy"),
+        RetrieveRequest(query="lumbar spine MRI radiculopathy", as_of_date=date(2026, 1, 1)),
         settings=settings,
         embed_fn=lambda texts: [[0.0] * 384 for _ in texts],
     )
-    assert mri.total_hits > 0
+    assert len(mri.chunks) > 0
     assert mri.chunks[0].doc_id in {"L33822", "A56542"}
     assert mri.chunks[0].bm25_rank == 1
     assert mri.chunks[0].vec_rank is None
 
 
-def test_golden_eval_passes_recall_gate_and_updates_manifest(tmp_path: Path) -> None:
-    """Verify golden eval achieves Recall@5 >= 0.85, 0 active leaks, and updates run_manifest."""
+def test_golden_eval_passes_recall_gate_and_writes_separate_report(tmp_path: Path) -> None:
+    """Verify golden eval writes eval_report.json without mutating immutable run_manifest.json."""
     settings = _build_sample_index(tmp_path)
+    manifest_path = settings.gold_dir / "run_manifest.json"
+    manifest_before = manifest_path.read_text(encoding="utf-8")
+
     report = evaluate_retrieval(
         settings,
         embed_fn=_hashed_bow_embed,
-        update_manifest=True,
     )
 
     assert report.passed is True
     assert report.total_queries >= 15
     assert report.recall_at_5 >= settings.min_recall_at_5
     assert report.mrr >= 0.85
-    assert report.active_filter_violations == 0
+    assert report.temporal_filter_violations == 0
     assert report.forbidden_doc_violations == 0
 
-    manifest_path = settings.gold_dir / "run_manifest.json"
-    manifest = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
-    assert manifest.eval_recall_at_5 == report.recall_at_5
-    assert manifest.eval_mrr == report.mrr
-    assert manifest.active_filter_violations == 0
+    # run_manifest.json remains byte-for-byte immutable; eval_report.json holds eval metrics.
+    assert manifest_path.read_text(encoding="utf-8") == manifest_before
+    eval_report_path = settings.gold_dir / "eval_report.json"
+    assert eval_report_path.exists()
+    persisted = EvalReport.model_validate_json(eval_report_path.read_text(encoding="utf-8"))
+    assert persisted.recall_at_5 == report.recall_at_5
+    assert persisted.temporal_filter_violations == 0
+
+    audit = audit_medallion(settings)
+    assert audit.manifest is not None
+    summary = render_manifest_summary(audit.manifest, audit, eval_report=report)
+    assert "Temporal Filter Violations" in summary
+    assert f"{report.recall_at_5:.3f}" in summary
 
 
-def test_eval_fails_when_recall_drops_below_gate(tmp_path: Path) -> None:
-    """Verify evaluation returns passed=False when expected documents are missing."""
+def test_eval_fails_when_recall_drops_and_custom_index_does_not_overwrite_gold_report(
+    tmp_path: Path,
+) -> None:
+    """Verify eval returns passed=False on missed docs and custom index_path leaves Gold intact."""
     settings = _build_sample_index(tmp_path)
     failing_queries = tmp_path / "failing_queries.json"
     failing_queries.write_text(
@@ -197,7 +270,7 @@ def test_eval_fails_when_recall_drops_below_gate(tmp_path: Path) -> None:
                     "query_id": "q_missing",
                     "query": "lumbar spine MRI radiculopathy",
                     "expected_doc_ids": ["NCD999.99"],
-                    "active_only": True,
+                    "as_of_date": "2026-01-01",
                 }
             ]
         ),
@@ -207,12 +280,13 @@ def test_eval_fails_when_recall_drops_below_gate(tmp_path: Path) -> None:
     report = evaluate_retrieval(
         settings,
         queries_path=failing_queries,
+        index_path=settings.gold_dir / "index.duckdb",
         embed_fn=_hashed_bow_embed,
-        update_manifest=False,
     )
     assert report.passed is False
     assert report.recall_at_5 == 0.0
     assert report.mrr == 0.0
+    assert not (settings.gold_dir / "eval_report.json").exists()
 
 
 def test_verify_citations_detects_grounded_and_hallucinated_ids() -> None:
@@ -227,12 +301,11 @@ def test_verify_citations_detects_grounded_and_hallucinated_ids() -> None:
         section_heading="Coverage Indications",
         chunk_text="Requires 6 weeks of conservative therapy.",
         token_count=7,
-        cpt_codes=["72148"],
+        hcpcs_codes=["72148"],
         icd10_codes=["M51.16"],
         mac_jurisdiction="Novitas Solutions (JH/JL)",
         effective_date=date(2022, 4, 1),
         retired_date=None,
-        is_active=True,
         rrf_score=0.032,
     )
 
@@ -274,12 +347,11 @@ def test_byo_key_synthesis_providers_and_zero_key_leakage() -> None:
         section_heading="Coverage Indications",
         chunk_text="Requires 6 weeks of conservative therapy unless red flags exist.",
         token_count=10,
-        cpt_codes=["72148"],
+        hcpcs_codes=["72148"],
         icd10_codes=["M51.16"],
         mac_jurisdiction="Novitas Solutions (JH/JL)",
         effective_date=date(2022, 4, 1),
         retired_date=None,
-        is_active=True,
         rrf_score=0.032,
     )
     secret_key = "sk-super-secret-byo-test-key"
@@ -302,6 +374,11 @@ def test_byo_key_synthesis_providers_and_zero_key_leakage() -> None:
     )
     assert openai_route.called
     assert openai_route.calls[0].request.headers["authorization"] == f"Bearer {secret_key}"
+    prompt_body = json.loads(openai_route.calls[0].request.content.decode("utf-8"))
+    assert (
+        "Effective: 2022-04-01, Retired: none, HCPCS: 72148"
+        in (prompt_body["messages"][1]["content"])
+    )
     assert openai_res.grounding_verified is True
     assert openai_res.cited_doc_ids == ["L33822"]
     assert secret_key not in openai_res.model_dump_json()
@@ -372,12 +449,25 @@ def test_cli_query_and_eval_sample_commands(
     assert cli.main(["build", "--sample"]) == 0
     capsys.readouterr()
 
-    assert cli.main(["query", "lumbar spine MRI", "--sample", "--cpt", "72148"]) == 0
+    assert (
+        cli.main(
+            ["query", "lumbar spine MRI", "--sample", "--hcpcs", "72148", "--as-of", "2026-01-01"]
+        )
+        == 0
+    )
     query_payload = json.loads(capsys.readouterr().out)
-    assert query_payload["total_hits"] > 0
+    assert "total_hits" not in query_payload
+    assert query_payload["as_of_date"] == "2026-01-01"
     assert {c["doc_id"] for c in query_payload["chunks"]} == {"L33822", "A56542"}
+
+    assert (
+        cli.main(["query", "bariatric surgery", "--sample", "--hcpcs", "43644", "--all-dates"]) == 0
+    )
+    all_dates_payload = json.loads(capsys.readouterr().out)
+    assert all_dates_payload["as_of_date"] is None
+    assert all_dates_payload["chunks"][0]["doc_id"] == "L33381"
 
     assert cli.main(["eval", "--sample"]) == 0
     eval_payload = json.loads(capsys.readouterr().out)
     assert eval_payload["passed"] is True
-    assert eval_payload["active_filter_violations"] == 0
+    assert eval_payload["temporal_filter_violations"] == 0

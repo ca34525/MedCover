@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Sequence
+from datetime import date
 from pathlib import Path
 
 from medcover.bronze import ingest_sample_fixtures, ingest_zip_or_dir
@@ -65,12 +66,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     query.add_argument("text", help="Natural-language coverage question.")
     query.add_argument("--top-k", type=int, default=5, help="Number of chunks to return.")
-    query.add_argument(
-        "--include-retired",
-        action="store_true",
-        help="Include retired policies in search results.",
+    temporal_group = query.add_mutually_exclusive_group()
+    temporal_group.add_argument(
+        "--as-of",
+        dest="as_of_date",
+        type=date.fromisoformat,
+        default=None,
+        help="Evaluate policy validity as of YYYY-MM-DD (defaults to today).",
     )
-    query.add_argument("--cpt", dest="cpt_code", default=None, help="Filter by CPT/HCPCS code.")
+    temporal_group.add_argument(
+        "--all-dates",
+        action="store_true",
+        help="Disable temporal filtering and search all active and historical policies.",
+    )
+    query.add_argument(
+        "--hcpcs",
+        dest="hcpcs_code",
+        default=None,
+        help="Filter by HCPCS/CPT procedure code.",
+    )
     query.add_argument("--icd10", dest="icd10_code", default=None, help="Filter by ICD-10 code.")
     query.add_argument(
         "--doc-type",
@@ -82,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mac",
         dest="mac_jurisdiction",
         default=None,
-        help="Filter by MAC jurisdiction.",
+        help="Filter by MAC jurisdiction (includes nationwide NCDs).",
     )
     query.add_argument(
         "--sample",
@@ -92,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     eval_cmd = subparsers.add_parser(
         "eval",
-        help="Run golden retrieval evaluation (Recall@5, MRR, active filter compliance).",
+        help="Run golden retrieval evaluation (Recall@5, MRR, temporal filter compliance).",
     )
     eval_cmd.add_argument(
         "--sample",
@@ -144,11 +158,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "query":
         if args.sample:
             settings = settings.model_copy(update={"data_dir": settings.data_dir / "sample"})
+        resolved_as_of: date | None = (
+            None
+            if args.all_dates
+            else (args.as_of_date if args.as_of_date is not None else date.today())
+        )
         request = RetrieveRequest(
             query=args.text,
             top_k=args.top_k,
-            active_only=not args.include_retired,
-            cpt_code=args.cpt_code,
+            as_of_date=resolved_as_of,
+            hcpcs_code=args.hcpcs_code,
             icd10_code=args.icd10_code,
             doc_type=args.doc_type,
             mac_jurisdiction=args.mac_jurisdiction,

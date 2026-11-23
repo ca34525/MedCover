@@ -1,16 +1,16 @@
-"""Offline golden retrieval evaluation harness (Recall@5, MRR, active filter compliance)."""
+"""Offline golden retrieval evaluation harness (Recall@5, MRR, temporal filter compliance)."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from pydantic import BaseModel, Field, TypeAdapter
 
 from medcover.config import Settings
-from medcover.contracts import DocType, RunManifest
+from medcover.contracts import DocType
 from medcover.retrieve import EmbedFn, HybridRetriever, RetrieveRequest
 
 
@@ -21,9 +21,9 @@ class EvalQuery(BaseModel):
     query: str = Field(min_length=1)
     expected_doc_ids: list[str] = Field(default_factory=list)
     forbidden_doc_ids: list[str] = Field(default_factory=list)
-    active_only: bool = Field(default=True)
+    as_of_date: date | None = Field(default=None)
     top_k: int = Field(default=5, ge=5, le=50)
-    cpt_code: str | None = Field(default=None)
+    hcpcs_code: str | None = Field(default=None)
     icd10_code: str | None = Field(default=None)
     doc_type: DocType | None = Field(default=None)
     mac_jurisdiction: str | None = Field(default=None)
@@ -34,24 +34,25 @@ class EvalQueryResult(BaseModel):
 
     query_id: str
     query: str
-    active_only: bool
+    as_of_date: date | None
     expected_doc_ids: list[str]
     retrieved_doc_ids: list[str]
     recall_at_5: float | None = Field(default=None, ge=0.0, le=1.0)
     reciprocal_rank: float | None = Field(default=None, ge=0.0, le=1.0)
-    active_filter_violations: int = Field(ge=0)
+    temporal_filter_violations: int = Field(ge=0)
     forbidden_doc_violations: int = Field(ge=0)
 
 
 class EvalReport(BaseModel):
     """Aggregate retrieval evaluation metrics and WAP gate pass/fail outcome."""
 
+    evaluated_at_utc: datetime
     passed: bool
     total_queries: int = Field(ge=0)
     scored_queries: int = Field(ge=0)
     recall_at_5: float = Field(ge=0.0, le=1.0)
     mrr: float = Field(ge=0.0, le=1.0)
-    active_filter_violations: int = Field(ge=0)
+    temporal_filter_violations: int = Field(ge=0)
     forbidden_doc_violations: int = Field(ge=0)
     min_recall_at_5: float = Field(ge=0.0, le=1.0)
     results: list[EvalQueryResult]
@@ -83,14 +84,17 @@ def evaluate_retrieval(
     queries_path: Path | None = None,
     index_path: Path | None = None,
     embed_fn: EmbedFn | None = None,
-    update_manifest: bool = True,
+    report_path: Path | None = None,
+    write_report: bool = True,
 ) -> EvalReport:
-    """Evaluate hybrid retrieval against golden queries and optionally record metrics in manifest.
+    """Evaluate hybrid retrieval against golden queries and optionally write ``eval_report.json``.
 
-    Inputs: ``Settings`` plus optional overrides for ``queries_path``, ``index_path``, ``embed_fn``.
+    Inputs: ``Settings`` plus optional overrides for ``queries_path``, ``index_path``, ``embed_fn``,
+    and ``report_path``.
     Output grain: single ``EvalReport`` containing aggregate ``Recall@5``, ``MRR``, and violations.
-    Invariants: passes strictly when ``recall_at_5 >= settings.min_recall_at_5``,
-    ``active_filter_violations == 0``, and ``forbidden_doc_violations == 0``.
+    Invariants: never mutates ``run_manifest.json``; passes strictly when
+    ``recall_at_5 >= settings.min_recall_at_5``, ``temporal_filter_violations == 0``, and
+    ``forbidden_doc_violations == 0``.
     """
     resolved_queries_path = queries_path if queries_path is not None else settings.eval_queries_path
     resolved_index_path = (
@@ -99,11 +103,10 @@ def evaluate_retrieval(
     queries = load_eval_queries(resolved_queries_path)
     retriever = HybridRetriever(resolved_index_path, settings=settings, embed_fn=embed_fn)
 
-    today = date.today()
     results: list[EvalQueryResult] = []
     recall_scores: list[float] = []
     rr_scores: list[float] = []
-    total_active_violations = 0
+    total_temporal_violations = 0
     total_forbidden_violations = 0
 
     for item in queries:
@@ -111,8 +114,8 @@ def evaluate_retrieval(
             RetrieveRequest(
                 query=item.query,
                 top_k=item.top_k,
-                active_only=item.active_only,
-                cpt_code=item.cpt_code,
+                as_of_date=item.as_of_date,
+                hcpcs_code=item.hcpcs_code,
                 icd10_code=item.icd10_code,
                 doc_type=item.doc_type,
                 mac_jurisdiction=item.mac_jurisdiction,
@@ -120,20 +123,20 @@ def evaluate_retrieval(
         )
         ranked_doc_ids = _dedupe_doc_ids(chunk.doc_id for chunk in response.chunks)
 
-        active_violations = 0
-        if item.active_only:
-            active_violations = sum(
+        temporal_violations = 0
+        if item.as_of_date is not None:
+            temporal_violations = sum(
                 1
                 for chunk in response.chunks
-                if (not chunk.is_active)
-                or (chunk.retired_date is not None and chunk.retired_date <= today)
+                if chunk.effective_date > item.as_of_date
+                or (chunk.retired_date is not None and chunk.retired_date <= item.as_of_date)
             )
         forbidden_set = {doc_id.upper() for doc_id in item.forbidden_doc_ids}
         forbidden_violations = sum(
             1 for chunk in response.chunks if chunk.doc_id.upper() in forbidden_set
         )
 
-        total_active_violations += active_violations
+        total_temporal_violations += temporal_violations
         total_forbidden_violations += forbidden_violations
 
         recall: float | None = None
@@ -150,12 +153,12 @@ def evaluate_retrieval(
             EvalQueryResult(
                 query_id=item.query_id,
                 query=item.query,
-                active_only=item.active_only,
+                as_of_date=item.as_of_date,
                 expected_doc_ids=item.expected_doc_ids,
                 retrieved_doc_ids=ranked_doc_ids,
                 recall_at_5=round(recall, 4) if recall is not None else None,
                 reciprocal_rank=round(rr, 4) if rr is not None else None,
-                active_filter_violations=active_violations,
+                temporal_filter_violations=temporal_violations,
                 forbidden_doc_violations=forbidden_violations,
             )
         )
@@ -166,29 +169,36 @@ def evaluate_retrieval(
     passed = (
         scored_queries > 0
         and mean_recall >= settings.min_recall_at_5
-        and total_active_violations == 0
+        and total_temporal_violations == 0
         and total_forbidden_violations == 0
     )
 
-    if update_manifest:
-        _update_run_manifest(
-            manifest_path=settings.gold_dir / "run_manifest.json",
-            recall_at_5=mean_recall,
-            mrr=mean_mrr,
-            active_filter_violations=total_active_violations,
-        )
-
-    return EvalReport(
+    report = EvalReport(
+        evaluated_at_utc=datetime.now(tz=UTC),
         passed=passed,
         total_queries=len(queries),
         scored_queries=scored_queries,
         recall_at_5=mean_recall,
         mrr=mean_mrr,
-        active_filter_violations=total_active_violations,
+        temporal_filter_violations=total_temporal_violations,
         forbidden_doc_violations=total_forbidden_violations,
         min_recall_at_5=settings.min_recall_at_5,
         results=results,
     )
+
+    target_report_path = (
+        report_path
+        if report_path is not None
+        else (settings.gold_dir / "eval_report.json" if index_path is None else None)
+    )
+    if write_report and target_report_path is not None:
+        target_report_path.parent.mkdir(parents=True, exist_ok=True)
+        target_report_path.write_text(
+            json.dumps(report.model_dump(mode="json"), indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    return report
 
 
 def _dedupe_doc_ids(doc_ids: Iterable[str]) -> list[str]:
@@ -207,26 +217,3 @@ def _reciprocal_rank(ranked_doc_ids: list[str], expected_upper: set[str]) -> flo
         if doc_id.upper() in expected_upper:
             return 1.0 / rank
     return 0.0
-
-
-def _update_run_manifest(
-    *,
-    manifest_path: Path,
-    recall_at_5: float,
-    mrr: float,
-    active_filter_violations: int,
-) -> None:
-    if not manifest_path.exists():
-        return
-    manifest = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
-    updated = manifest.model_copy(
-        update={
-            "eval_recall_at_5": recall_at_5,
-            "eval_mrr": mrr,
-            "active_filter_violations": active_filter_violations,
-        }
-    )
-    manifest_path.write_text(
-        json.dumps(updated.model_dump(mode="json"), indent=2) + "\n",
-        encoding="utf-8",
-    )

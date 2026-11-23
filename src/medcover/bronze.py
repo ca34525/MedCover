@@ -40,6 +40,12 @@ _CMS_STATUS_MAP: dict[str, str] = {
     "RETIRED": "RETIRED",
 }
 
+_CODE_SYSTEM_MAP: dict[str, str] = {
+    "CPT": "HCPCS",
+    "HCPCS": "HCPCS",
+    "ICD10": "ICD10",
+}
+
 _EFFECTIVE_DATE_KEYS: tuple[str, ...] = (
     "effective_date",
     "rev_eff_date",
@@ -465,12 +471,11 @@ def _normalize_document_rows(
         retired_date = parse_optional_date(_first_present(lowered, _RETIRED_DATE_KEYS))
 
         raw_status = parse_optional_str(lowered.get("status"))
-        if raw_status is not None:
-            status: str | None = _CMS_STATUS_MAP.get(raw_status.upper(), raw_status.upper())
-        elif spec.is_cms_native:
-            status = "RETIRED" if retired_date is not None else "ACTIVE"
-        else:
-            status = None
+        status: str | None = (
+            _CMS_STATUS_MAP.get(raw_status.upper(), raw_status.upper())
+            if raw_status is not None
+            else None
+        )
 
         record: dict[str, Any] = {
             "doc_id": doc_id,
@@ -501,10 +506,15 @@ def _normalize_crosswalk_rows(
         doc_id, version, _ = _extract_identity(lowered, spec)
 
         if not spec.is_cms_native:
-            code_system = parse_optional_str(lowered.get("code_system"))
+            raw_system = parse_optional_str(lowered.get("code_system"))
+            code_system = (
+                _CODE_SYSTEM_MAP.get(raw_system.upper(), raw_system.upper())
+                if raw_system is not None
+                else None
+            )
             code = parse_optional_str(lowered.get("code"))
         elif (code := parse_optional_str(lowered.get("hcpc_code_id"))) is not None:
-            code_system = "CPT" if code.isdigit() and len(code) == 5 else "HCPCS"
+            code_system = "HCPCS"
         elif (code := parse_optional_str(lowered.get("icd10_code_id"))) is not None:
             code_system = "ICD10"
         else:
@@ -566,9 +576,10 @@ def _coerce_crosswalk_record(row: Mapping[str, Any]) -> dict[str, Any]:
     if not (doc_id and version is not None and code_system and code):
         msg = f"Bronze crosswalk requires doc_id, version, code_system, and code: {row!r}"
         raise ValueError(msg)
+    normalized_system = _CODE_SYSTEM_MAP.get(code_system.upper(), code_system.upper())
     return {
         "doc_id": doc_id,
         "version": version,
-        "code_system": code_system.upper(),
+        "code_system": normalized_system,
         "code": code.upper(),
     }

@@ -28,7 +28,7 @@ Write every module, SQL query, test, and workflow as if a senior data engineer w
 Verify every invariant below before finishing any change:
 1. **Strict Grain Preservation:**
    - `bronze/raw_documents.parquet`: unique `(doc_id, version)`.
-   - `silver/policies.parquet`: unique `(doc_id, version)`. Aggregate CPT/HCPCS and ICD-10 crosswalks with `LIST(DISTINCT code)`—never join 1-to-many code rows directly onto policy text.
+   - `silver/policies.parquet`: unique `(doc_id, version)`. Aggregate HCPCS/CPT (`hcpcs_codes`) and ICD-10 (`icd10_codes`) crosswalks with `LIST(DISTINCT code)`—never join 1-to-many code rows directly onto policy text.
    - `gold/chunks.parquet`: unique `(doc_id, version, chunk_index)` with deterministic `chunk_id` and `chunk_sha256`.
 2. **Idempotent Incremental Embedding:**
    - Re-running `medcover build` on unchanged inputs MUST produce identical Gold counts and `chunks_embedded == 0`.
@@ -36,10 +36,11 @@ Verify every invariant below before finishing any change:
 3. **Structure-Preserving HTML Parsing:**
    - Convert HTML to Markdown preserving heading hierarchy (`#`, `##`) and tables. Never flatten tables with naive regex stripping.
 4. **Build-Time Indexing & Pre-Baked Runtime:**
-   - `gold.py` MUST build `index.duckdb` (including `PRAGMA create_fts_index(...)`) at pipeline build time; `api.py` MUST open `index.duckdb` in `read_only=True` mode and NEVER rebuild FTS indexes during container startup.
+   - `gold.py` MUST build `index.duckdb` (including `PRAGMA create_fts_index(...)` plus query-time `chunks_as_of(as_of_date)` macro and `active_chunks` view) at pipeline build time; `api.py` MUST open `index.duckdb` in `read_only=True` mode and NEVER rebuild FTS indexes during container startup.
    - `Dockerfile` MUST pre-download the `BAAI/bge-small-en-v1.5` ONNX model during `docker build` so ECS containers start with zero external model downloads.
 5. **Temporal & WAP Safety:**
-   - Every Gold chunk MUST carry `effective_date`, `retired_date`, and `is_active`. Queries with `active_only=True` MUST have `active_filter_violations == 0`.
+   - Every Gold chunk MUST store the timeless validity interval `[effective_date, retired_date)` (never a materialized `is_active` column). Queries with `as_of_date` MUST evaluate `effective_date <= as_of_date AND (retired_date IS NULL OR retired_date > as_of_date)` and achieve `temporal_filter_violations == 0`.
+   - `run_manifest.json` MUST remain an immutable build record written by `gold.py`; `eval.py` MUST write evaluation output separately to `eval_report.json`.
    - `publish.py` MUST NEVER update `latest.json` unless Pandera contracts, `dq_invariants.sql`, and `eval.py` all pass.
 6. **Zero-Trust BYO-Key Handling:**
    - Pass `X-LLM-API-Key` strictly in memory on the outbound `httpx` request. NEVER persist, cache, log, or echo the key in logs, exceptions, or responses.

@@ -3,130 +3,137 @@
     "query_id": "q01_pet_nsclc",
     "query": "Does Medicare cover FDG PET scans for non-small cell lung cancer initial treatment strategy?",
     "expected_doc_ids": ["NCD220.6"],
-    "active_only": true
+    "as_of_date": "2026-01-01"
   },
   {
-    "query_id": "q02_pet_myocardial_cpt",
+    "query_id": "q02_pet_myocardial_hcpcs",
     "query": "Myocardial perfusion imaging PET with Rubidium-82 for suspected coronary artery disease",
     "expected_doc_ids": ["NCD220.6"],
-    "cpt_code": "78491",
-    "active_only": true
+    "hcpcs_code": "78491",
+    "as_of_date": "2026-01-01"
   },
   {
     "query_id": "q03_colorectal_screening_cologuard",
     "query": "Coverage frequency for multi-target stool DNA Cologuard and screening colonoscopy",
     "expected_doc_ids": ["NCD210.3"],
-    "active_only": true
+    "as_of_date": "2026-01-01"
   },
   {
     "query_id": "q04_colorectal_followon_hcpcs",
     "query": "Preventive screening colonoscopy after a positive stool-based colorectal test",
     "expected_doc_ids": ["NCD210.3"],
-    "cpt_code": "G0121",
-    "active_only": true
+    "hcpcs_code": "G0121",
+    "as_of_date": "2026-01-01"
   },
   {
     "query_id": "q05_home_oxygen_blood_gas",
     "query": "What arterial PaO2 and SpO2 hypoxemia thresholds qualify for Medicare home oxygen therapy?",
     "expected_doc_ids": ["NCD240.2"],
-    "active_only": true
+    "as_of_date": "2026-01-01"
   },
   {
     "query_id": "q06_icd_primary_prevention",
     "query": "LVEF threshold, post-MI waiting period, and shared decision making for implantable defibrillators",
     "expected_doc_ids": ["NCD20.4"],
     "doc_type": "NCD",
-    "active_only": true
+    "as_of_date": "2026-01-01"
   },
   {
-    "query_id": "q07_blood_counts_cbc_cpt",
+    "query_id": "q07_blood_counts_cbc_hcpcs",
     "query": "When are complete blood counts with automated differential covered versus routine screening?",
     "expected_doc_ids": ["NCD190.15"],
-    "cpt_code": "85025",
-    "active_only": true
+    "hcpcs_code": "85025",
+    "as_of_date": "2026-01-01"
   },
   {
     "query_id": "q08_lumbar_mri_conservative_lcd",
     "query": "How many weeks of conservative therapy are required before lumbar spine MRI and red flag exceptions?",
     "expected_doc_ids": ["L33822"],
     "doc_type": "LCD",
-    "active_only": true
+    "as_of_date": "2026-01-01"
   },
   {
     "query_id": "q09_lumbar_mri_modifiers_article",
     "query": "Professional and technical modifiers 26 TC and ICD-10 diagnosis codes for lumbar spine MRI claims",
     "expected_doc_ids": ["A56542"],
     "doc_type": "ARTICLE",
-    "active_only": true
+    "as_of_date": "2026-01-01"
   },
   {
-    "query_id": "q10_lumbar_mri_cpt_icd10_pair",
+    "query_id": "q10_lumbar_mri_hcpcs_icd10_pair",
     "query": "Lumbar spine MRI without contrast for radiculopathy coverage and billing rules",
     "expected_doc_ids": ["L33822", "A56542"],
-    "cpt_code": "72148",
+    "hcpcs_code": "72148",
     "icd10_code": "M51.16",
-    "active_only": true
+    "as_of_date": "2026-01-01"
   },
   {
     "query_id": "q11_pap_sleep_apnea_lcd",
     "query": "What AHI diagnostic threshold and 90-day adherence hours per night are required for CPAP coverage?",
     "expected_doc_ids": ["L33718"],
     "doc_type": "LCD",
-    "active_only": true
+    "as_of_date": "2026-01-01"
   },
   {
     "query_id": "q12_pap_modifier_kx_article",
     "query": "When must suppliers append modifier KX to CPAP E0601 and full face mask A7030 replacements?",
     "expected_doc_ids": ["A52467"],
-    "cpt_code": "A7030",
-    "active_only": true
+    "hcpcs_code": "A7030",
+    "as_of_date": "2026-01-01"
   },
   {
     "query_id": "q13_cataract_extraction_mac",
     "query": "Functional impairment criteria for standard versus complex cataract extraction surgery",
     "expected_doc_ids": ["L35041"],
     "mac_jurisdiction": "First Coast Service Options (JN)",
-    "active_only": true
+    "as_of_date": "2026-01-01"
   },
   {
     "query_id": "q14_moldx_nsclc_biomarkers",
     "query": "Next-generation sequencing NGS panel coverage for EGFR and ALK mutations in metastatic NSCLC",
     "expected_doc_ids": ["L34998"],
     "icd10_code": "C34.90",
-    "active_only": true
+    "as_of_date": "2026-01-01"
   },
   {
     "query_id": "q15_cgm_diabetes_article",
     "query": "Continuous glucose monitor coverage for insulin-treated diabetes and 6-month follow-up visits",
     "expected_doc_ids": ["A57690"],
-    "cpt_code": "E2103",
-    "active_only": true
+    "hcpcs_code": "E2103",
+    "as_of_date": "2026-01-01"
   },
   {
     "query_id": "q16_mohs_surgery_bundling",
     "query": "Covered high-risk anatomic sites for Mohs micrographic surgery and surgical pathology 88305 bundling",
     "expected_doc_ids": ["A56632"],
-    "active_only": true
+    "as_of_date": "2026-01-01"
   },
   {
-    "query_id": "q17_bariatric_retired_included",
+    "query_id": "q17_bariatric_all_dates_included",
     "query": "Legacy MAC bariatric surgery Roux-en-Y gastric bypass and sleeve gastrectomy BMI criteria",
     "expected_doc_ids": ["L33381"],
-    "active_only": false
+    "as_of_date": null
   },
   {
     "query_id": "q18_bariatric_retired_excluded",
     "query": "Roux-en-Y gastric bypass and laparoscopic sleeve gastrectomy for morbid obesity",
     "expected_doc_ids": [],
     "forbidden_doc_ids": ["L33381"],
-    "active_only": true
+    "as_of_date": "2026-01-01"
   },
   {
-    "query_id": "q19_bariatric_retired_cpt_excluded",
+    "query_id": "q19_bariatric_retired_hcpcs_excluded",
     "query": "Laparoscopic Roux-en-Y gastric bypass coverage criteria",
     "expected_doc_ids": [],
     "forbidden_doc_ids": ["L33381"],
-    "cpt_code": "43644",
-    "active_only": true
+    "hcpcs_code": "43644",
+    "as_of_date": "2026-01-01"
+  },
+  {
+    "query_id": "q20_bariatric_point_in_time_2023",
+    "query": "Roux-en-Y gastric bypass and sleeve gastrectomy bariatric surgery coverage criteria",
+    "expected_doc_ids": ["L33381"],
+    "hcpcs_code": "43644",
+    "as_of_date": "2023-06-01"
   }
 ]

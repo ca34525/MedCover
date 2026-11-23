@@ -44,8 +44,8 @@ class RetrieveRequest(BaseModel):
 
     query: str = Field(min_length=1)
     top_k: int = Field(default=5, ge=1, le=50)
-    active_only: bool = Field(default=True)
-    cpt_code: str | None = Field(default=None)
+    as_of_date: date | None = Field(default_factory=date.today)
+    hcpcs_code: str | None = Field(default=None)
     icd10_code: str | None = Field(default=None)
     doc_type: DocType | None = Field(default=None)
     mac_jurisdiction: str | None = Field(default=None)
@@ -59,7 +59,7 @@ class RetrieveRequest(BaseModel):
             raise ValueError(msg)
         return cleaned
 
-    @field_validator("cpt_code", "icd10_code", mode="before")
+    @field_validator("hcpcs_code", "icd10_code", mode="before")
     @classmethod
     def _normalize_code(cls, value: Any) -> str | None:
         cleaned = parse_optional_str(value)
@@ -89,12 +89,11 @@ class RetrievedChunk(BaseModel):
     section_heading: str
     chunk_text: str
     token_count: int
-    cpt_codes: list[str]
+    hcpcs_codes: list[str]
     icd10_codes: list[str]
     mac_jurisdiction: str | None
     effective_date: date
     retired_date: date | None
-    is_active: bool
     bm25_score: float | None = None
     bm25_rank: int | None = None
     cosine_distance: float | None = None
@@ -106,8 +105,7 @@ class RetrieveResponse(BaseModel):
     """Ranked hybrid retrieval result set with filter provenance."""
 
     query: str
-    active_only: bool
-    total_hits: int = Field(ge=0)
+    as_of_date: date | None
     chunks: list[RetrievedChunk]
 
 
@@ -161,8 +159,8 @@ class HybridRetriever:
 
         Inputs: validated ``RetrieveRequest`` containing query text, ``top_k``, and filters.
         Output grain: ``RetrieveResponse`` with up to ``top_k`` ranked ``RetrievedChunk`` rows.
-        Invariants: opens DuckDB with ``read_only=True``; enforces ``is_active`` when
-        ``active_only=True``.
+        Invariants: opens DuckDB with ``read_only=True``; enforces
+        ``[effective_date, retired_date)`` containment whenever ``as_of_date`` is provided.
         """
         query_embedding = self._embed_query(request.query)
         candidate_limit = max(request.top_k * 4, 25)
@@ -187,8 +185,7 @@ class HybridRetriever:
         chunks = [_row_to_chunk(row) for row in rows]
         return RetrieveResponse(
             query=request.query,
-            active_only=request.active_only,
-            total_hits=len(chunks),
+            as_of_date=request.as_of_date,
             chunks=chunks,
         )
 
@@ -335,8 +332,8 @@ def _build_search_params_table(
         [
             pa.field("query_text", pa.string(), nullable=False),
             pa.field("query_embedding", pa.list_(pa.float32(), embedding_dim), nullable=False),
-            pa.field("active_only", pa.bool_(), nullable=False),
-            pa.field("cpt_code", pa.string(), nullable=True),
+            pa.field("as_of_date", pa.date32(), nullable=True),
+            pa.field("hcpcs_code", pa.string(), nullable=True),
             pa.field("icd10_code", pa.string(), nullable=True),
             pa.field("doc_type", pa.string(), nullable=True),
             pa.field("mac_jurisdiction", pa.string(), nullable=True),
@@ -350,8 +347,8 @@ def _build_search_params_table(
             {
                 "query_text": request.query,
                 "query_embedding": list(query_embedding),
-                "active_only": request.active_only,
-                "cpt_code": request.cpt_code,
+                "as_of_date": request.as_of_date,
+                "hcpcs_code": request.hcpcs_code,
                 "icd10_code": request.icd10_code,
                 "doc_type": request.doc_type,
                 "mac_jurisdiction": request.mac_jurisdiction,
@@ -375,12 +372,11 @@ def _row_to_chunk(row: dict[str, Any]) -> RetrievedChunk:
         section_heading=str(row["section_heading"]),
         chunk_text=str(row["chunk_text"]),
         token_count=int(row["token_count"]),
-        cpt_codes=[str(code) for code in (row["cpt_codes"] or ())],
+        hcpcs_codes=[str(code) for code in (row["hcpcs_codes"] or ())],
         icd10_codes=[str(code) for code in (row["icd10_codes"] or ())],
         mac_jurisdiction=parse_optional_str(row["mac_jurisdiction"]),
         effective_date=row["effective_date"],
         retired_date=row["retired_date"],
-        is_active=bool(row["is_active"]),
         bm25_score=float(row["bm25_score"]) if row["bm25_score"] is not None else None,
         bm25_rank=int(row["bm25_rank"]) if row["bm25_rank"] is not None else None,
         cosine_distance=(
@@ -397,11 +393,11 @@ def _build_user_prompt(query: str, chunks: Sequence[RetrievedChunk]) -> str:
 
     blocks: list[str] = []
     for chunk in chunks:
-        status = "ACTIVE" if chunk.is_active else "RETIRED"
-        codes = ", ".join(chunk.cpt_codes[:10]) if chunk.cpt_codes else "none"
+        codes = ", ".join(chunk.hcpcs_codes[:10]) if chunk.hcpcs_codes else "none"
+        retired = chunk.retired_date.isoformat() if chunk.retired_date is not None else "none"
         blocks.append(
-            f"[{chunk.doc_id}] ({chunk.doc_type} v{chunk.version}, {status}, "
-            f"Effective: {chunk.effective_date.isoformat()}, CPT/HCPCS: {codes})\n"
+            f"[{chunk.doc_id}] ({chunk.doc_type} v{chunk.version}, "
+            f"Effective: {chunk.effective_date.isoformat()}, Retired: {retired}, HCPCS: {codes})\n"
             f"Title: {chunk.title}\n"
             f"Section: {chunk.section_heading}\n"
             f"{chunk.chunk_text}"

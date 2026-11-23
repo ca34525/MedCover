@@ -44,14 +44,18 @@ def test_malformed_fixture_routed_to_quarantine(tmp_path: Path) -> None:
     assert silver_res.quarantine_rate <= settings.max_quarantine_rate
 
 
-def test_missing_title_and_date_inversion_quarantined(tmp_path: Path) -> None:
-    """Verify custom malformed inputs are explicitly quarantined with accurate failure reasons."""
+def test_missing_title_date_inversion_and_retired_without_date_quarantined(
+    tmp_path: Path,
+) -> None:
+    """Verify malformed inputs and undated RETIRED rows route to quarantine cleanly."""
     bad_csv = tmp_path / "bad_docs.csv"
     bad_csv.write_text(
         "doc_id,doc_type,version,title,mac_jurisdiction,effective_date,retired_date,status,raw_html\n"
         'L11111,LCD,1,,Novitas,2024-01-01,,ACTIVE,"<p>Valid text</p>"\n'
         'L22222,LCD,1,Inverted Dates,Novitas,2024-06-01,2024-01-01,RETIRED,"<p>Valid text</p>"\n'
-        'L33333,LCD,1,Valid Policy,Novitas,2024-01-01,,ACTIVE,"<h1>Good</h1><p>Covered.</p>"\n',
+        'L22223,LCD,1,Undated Retired,Novitas,2024-01-01,,RETIRED,"<p>Valid text</p>"\n'
+        'L33333,LCD,1,Valid Policy,Novitas,2024-01-01,,ACTIVE,"<h1>Good</h1><p>Covered.</p>"\n'
+        'L33334,LCD,1,Future Retire,Novitas,2024-01-01,2099-12-31,,"<h1>Future</h1><p>OK.</p>"\n',
         encoding="utf-8",
     )
 
@@ -62,12 +66,12 @@ def test_missing_title_and_date_inversion_quarantined(tmp_path: Path) -> None:
     quarantine_df = pd.read_parquet(silver_res.quarantine_path)
     policies_df = pd.read_parquet(silver_res.policies_path)
 
-    assert len(policies_df) == 1
-    assert policies_df.iloc[0]["doc_id"] == "L33333"
-    assert len(quarantine_df) == 2
+    assert set(policies_df["doc_id"]) == {"L33333", "L33334"}
+    assert len(quarantine_df) == 3
     reasons = dict(zip(quarantine_df["doc_id"], quarantine_df["failure_reason"], strict=True))
     assert "missing_title" in reasons["L11111"]
     assert "retired_date_before_effective_date" in reasons["L22222"]
+    assert "retired_without_date" in reasons["L22223"]
     assert silver_res.quarantine_rate > settings.max_quarantine_rate
 
 
@@ -166,8 +170,8 @@ def test_audit_medallion_fails_when_quarantine_rate_exceeds_threshold(tmp_path: 
     assert "quarantine_rate_within_limit" in failed_names
 
 
-def test_audit_medallion_catches_gold_sql_and_temporal_violations(tmp_path: Path) -> None:
-    """Verify dq_invariants.sql catches duplicates, empty text, NaN vectors, and active leaks."""
+def test_audit_medallion_catches_gold_sql_and_date_violations(tmp_path: Path) -> None:
+    """Verify dq_invariants.sql catches duplicates, empty text, NaN vectors, and inverted dates."""
     settings = Settings(data_dir=tmp_path)
     ingest_sample_fixtures(settings)
     silver_res = build_silver(settings)
@@ -183,8 +187,8 @@ def test_audit_medallion_catches_gold_sql_and_temporal_violations(tmp_path: Path
     corrupted = dict(rows[0])
     corrupted["chunk_text"] = "   "
     corrupted["token_count"] = settings.chunk_token_limit + 50
+    corrupted["effective_date"] = date(2025, 1, 1)
     corrupted["retired_date"] = date(2020, 1, 1)
-    corrupted["is_active"] = True
     bad_vec = list(corrupted["embedding"])
     bad_vec[0] = float("nan")
     corrupted["embedding"] = bad_vec
@@ -203,7 +207,7 @@ def test_audit_medallion_catches_gold_sql_and_temporal_violations(tmp_path: Path
         "gold_non_empty_chunk_text",
         "gold_bounded_token_count",
         "gold_valid_embeddings",
-        "gold_active_flag_consistency",
+        "gold_valid_dates",
         "manifest_counts_match",
     }
     assert expected_failures.issubset(failed_names)

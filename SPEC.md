@@ -9,7 +9,7 @@ Concretely, raw HTML policies and relational code tables enter through two inter
 Every module, SQL query, and workflow in this repository recombines four primitives:
 1. **Medallion Tables (Bronze -> Silver -> Gold):** Immutable raw snapshots, grain-safe policy Markdown with code arrays, and incrementally embedded chunks + pre-built DuckDB FTS index.
 2. **Contracts & Write-Audit-Publish (WAP):** Pandera schemas, SQL invariants, dead-letter quarantine, and a `Recall@5` gate that block promotion to S3 `latest.json` on any regression.
-3. **Hybrid SQL Retrieval:** A single DuckDB query fusing BM25 lexical rank and cosine vector rank (Reciprocal Rank Fusion) with strict `is_active` and billing-code filters.
+3. **Hybrid SQL Retrieval:** A single DuckDB query fusing BM25 lexical rank and cosine vector rank (Reciprocal Rank Fusion) with strict point-in-time `as_of_date`, HCPCS/ICD-10 billing-code, and MAC+NCD filters.
 4. **Keyless OIDC Delivery:** GitHub Actions authenticating to AWS via short-lived OIDC tokens—separating **code releases** (`ci.yml` -> ECR -> ECS Fargate) from **data releases** (`sync-mcd.yml` -> S3 WAP -> ECS rolling refresh).
 
 ### Locked-In Technical Choices
@@ -68,7 +68,7 @@ medcover-rag-pipeline/
     ├── test_silver_parsing.py       # HTML table/heading preservation and zero code fan-out
     ├── test_gold_idempotency.py     # Repeat-run 0 re-embeds; 1-doc edit re-embeds delta only
     ├── test_quality_quarantine.py   # Malformed routing, date inversion, quarantine threshold
-    ├── test_retrieval_eval.py       # Recall@5 gate + 0% retired leakage on active_only queries
+    ├── test_retrieval_eval.py       # Recall@5 gate + 0% temporal leakage on as_of_date queries
     └── test_api.py                  # /health, /retrieve, mocked /ask + citation verification
 ~~~
 
@@ -91,45 +91,45 @@ Both ingestion modes write the exact same Bronze Parquet schema so every downstr
 
 ### Bronze (`bronze/raw_documents.parquet`, `bronze/raw_code_crosswalks.parquet`)
 - **Grain:** Strictly 1 row per `(doc_id, version)` in `raw_documents`.
-- **Columns:** `doc_id` (e.g., `L33822`, `A56542`, `NCD220.6`), `doc_type` (`NCD` | `LCD` | `ARTICLE`), `version` (int), `title`, `raw_html`, `mac_jurisdiction` (nullable for NCD), `effective_date`, `retired_date` (nullable), `status` (`ACTIVE` | `RETIRED`), `source_mode` (`zip` | `api`), `ingested_at` (UTC), `source_sha256`.
+- **Columns:** `doc_id` (e.g., `L33822`, `A56542`, `NCD220.6`), `doc_type` (`NCD` | `LCD` | `ARTICLE`), `version` (int), `title`, `raw_html`, `mac_jurisdiction` (nullable for NCD), `effective_date`, `retired_date` (nullable), `status` (nullable raw CMS status `ACTIVE` | `RETIRED`, never fabricated), `source_mode` (`zip` | `api`), `ingested_at` (UTC), `source_sha256`. Crosswalks normalize `code_system` to `HCPCS` | `ICD10` (CPT is HCPCS Level I).
 - **Rule:** Upsert by `(doc_id, version)`; never overwrite historical versions in place.
 
 ### Silver (`silver/policies.parquet`, `silver/quarantine.parquet`)
 - **Grain:** Strictly 1 row per `(doc_id, version)`.
 - **Transforms:**
   1. Convert `raw_html` to clean Markdown preserving heading hierarchy (`#`, `##`, `###`) and Markdown tables (vital for coverage criteria and billing-code tables).
-  2. Join CPT/HCPCS and ICD-10 crosswalks inside `sql/silver_policies.sql` using **`LIST(DISTINCT code)`** (`cpt_codes VARCHAR[]`, `icd10_codes VARCHAR[]`) so 1-to-many code links never cause row fan-out.
-  3. Derive `is_active`: `status = 'ACTIVE' AND (retired_date IS NULL OR retired_date > CURRENT_DATE)`.
-- **Quarantine:** Records with missing required keys, empty cleaned text, or `retired_date < effective_date` route to `silver/quarantine.parquet` with an explicit `failure_reason` and are excluded from Gold.
+  2. Join HCPCS/CPT and ICD-10 crosswalks inside `sql/silver_policies.sql` using **`LIST(DISTINCT code)`** (`hcpcs_codes VARCHAR[]`, `icd10_codes VARCHAR[]`) so 1-to-many code links never cause row fan-out.
+  3. Preserve the timeless validity interval `[effective_date, retired_date)`—no materialized `is_active` flag or redundant `status` column.
+- **Quarantine:** Records with missing required keys, empty cleaned text, `retired_date < effective_date`, or contradictory `status = 'RETIRED'` with null `retired_date` route to `silver/quarantine.parquet` with an explicit `failure_reason` and are excluded from Gold.
 
 ### Gold (`gold/chunks.parquet`, `gold/index.duckdb`, `gold/run_manifest.json`)
 - **Grain:** Strictly 1 row per `(doc_id, version, chunk_index)`.
-- **Columns:** `chunk_id` (`{doc_id}_v{version}_c{chunk_index:04d}`), `doc_id`, `doc_type`, `version`, `title`, `section_heading`, `chunk_text`, `token_count`, `chunk_sha256`, `cpt_codes VARCHAR[]`, `icd10_codes VARCHAR[]`, `mac_jurisdiction`, `effective_date`, `retired_date`, `is_active`, `embedding FLOAT[384]`, `embedding_model`.
+- **Columns:** `chunk_id` (`{doc_id}_v{version}_c{chunk_index:04d}`), `doc_id`, `doc_type`, `version`, `title`, `section_heading`, `chunk_text`, `token_count`, `chunk_sha256`, `hcpcs_codes VARCHAR[]`, `icd10_codes VARCHAR[]`, `mac_jurisdiction`, `effective_date`, `retired_date`, `embedding FLOAT[384]`, `embedding_model`.
 - **Chunking & Incremental Embedding:**
   - Split on Markdown heading boundaries first, then apply a configurable token budget (default 450 tokens, 60-token overlap) avoiding mid-row table splits.
   - Left-join candidate chunks against prior Gold on `chunk_sha256`; reuse existing vectors for unchanged chunks and run batched `fastembed` CPU inference strictly on net-new or modified chunks.
 - **Dual Gold Artifacts (Built Together):**
   - `chunks.parquet`: Canonical Lakehouse data product for downstream ML/analytics/Databricks consumers.
-  - `index.duckdb`: Pre-indexed DuckDB database loaded from `chunks.parquet` with `PRAGMA create_fts_index(...)` already built at pipeline time, allowing the serving container to open it read-only in under one second with minimal memory overhead across the full 10,000+ document corpus.
-- **Run Manifest (`run_manifest.json`):** `run_id`, `git_sha`, `timestamp_utc`, `source_mode`, `bronze_docs`, `silver_docs`, `quarantined_docs`, `quarantine_rate`, `gold_chunks`, `chunks_reused`, `chunks_embedded`, `token_p50`, `token_p95`, `eval_recall_at_5`, `eval_mrr`, `active_filter_violations`.
+  - `index.duckdb`: Pre-indexed DuckDB database loaded from `chunks.parquet` with `PRAGMA create_fts_index(...)` plus query-time `chunks_as_of(as_of_date)` table macro and `active_chunks` view already built at pipeline time, allowing the serving container to open it read-only in under one second with minimal memory overhead across the full 10,000+ document corpus.
+- **Immutable Build Manifest (`run_manifest.json`) & Eval Output (`eval_report.json`):** `run_manifest.json` records immutable build provenance (`run_id`, `git_sha`, `timestamp_utc`, `source_modes`, `bronze_docs`, `silver_docs`, `quarantined_docs`, `gold_chunks`, `chunks_reused`, `chunks_embedded`, `token_p50`, `token_p95`; `quarantine_rate` is computed on read). `medcover eval` writes `eval_report.json` separately (`evaluated_at_utc`, `passed`, `recall_at_5`, `mrr`, `temporal_filter_violations`, `forbidden_doc_violations`, per-query results) and never mutates `run_manifest.json`.
 
 ---
 
 ## 5. Write-Audit-Publish (WAP) & Serving Architecture
 
 ### Write-Audit-Publish (`publish.py`)
-1. **Write:** Emit `chunks.parquet`, `index.duckdb`, `quarantine.parquet`, and `run_manifest.json` into a staged release path (`releases/<run_id>/`).
-2. **Audit:** Execute Pandera contracts, `sql/dq_invariants.sql` (unique grain, zero empty text, zero null vectors, bounded token counts, `quarantine_rate <= 0.10`), and `eval.py` (`Recall@5 >= 0.85`, `active_filter_violations == 0`).
+1. **Write:** Emit `chunks.parquet`, `index.duckdb`, `quarantine.parquet`, `run_manifest.json`, and `eval_report.json` into a staged release path (`releases/<run_id>/`).
+2. **Audit:** Execute Pandera contracts, `sql/dq_invariants.sql` (unique grain, zero empty text, zero null vectors, valid date intervals, bounded token counts, `quarantine_rate <= 0.10`), and `eval.py` (`Recall@5 >= 0.85`, `temporal_filter_violations == 0`).
 3. **Publish:** Only if Audit passes with exit code 0, upload the staged release to `s3://<bucket>/gold/releases/<run_id>/` and atomically overwrite `s3://<bucket>/gold/latest.json` (`{"run_id": "...", "chunks_uri": "...", "index_uri": "...", "manifest_uri": "..."}`). Failed runs never alter `latest.json`.
 
 ### Hybrid Retrieval (`sql/hybrid_search.sql`, `retrieve.py`)
-- Pre-filters chunks by `active_only` (default `true`), optional `cpt_code` (`list_contains(cpt_codes, ?)`), `icd10_code`, `doc_type`, and `mac_jurisdiction`.
+- Pre-filters chunks by point-in-time `as_of_date` (defaults to today at request time; `null` disables temporal filtering) enforcing `effective_date <= as_of_date AND (retired_date IS NULL OR retired_date > as_of_date)`, optional `hcpcs_code` (`list_contains(hcpcs_codes, ?)`), `icd10_code`, `doc_type`, and `mac_jurisdiction` (which includes nationwide `NCD` policies alongside the specified MAC's local LCDs/Articles).
 - Retrieves top lexical candidates via DuckDB `fts` BM25 and top semantic candidates via `array_cosine_distance(embedding, ?::FLOAT[384])`.
 - Combines both candidate sets via **Reciprocal Rank Fusion (RRF)**: `score = 1/(60 + rank_bm25) + 1/(60 + rank_vec)`.
 
 ### Thin FastAPI Service (`api.py`)
 - **Startup:** Reads `latest.json` from S3 (using the ECS Task Role, zero static credentials) or local disk, downloads `index.duckdb` + `run_manifest.json` to `/tmp/`, and opens `index.duckdb` in `read_only=True` mode alongside the pre-baked FastEmbed ONNX model.
-- **`GET /health`:** Returns `200 OK` with `run_id`, `chunk_count`, `active_docs`, `retired_docs`, and `embedding_model` (wired as the ECS ALB health check path).
+- **`GET /health`:** Returns `200 OK` with `run_id`, `chunk_count`, `doc_count`, live `active_docs` / `retired_docs` (evaluated against `CURRENT_DATE`), and `embedding_model` (wired as the ECS ALB health check path).
 - **`POST /retrieve`:** Keyless. Returns ranked chunks, RRF scores, and full provenance metadata.
 - **`POST /ask`:** Stateless BYO-key RAG endpoint. Accepts search parameters + `X-LLM-API-Key` header + `provider` (`openai` | `anthropic` | `gemini`, via lightweight `httpx` JSON calls). Prompts the model to answer strictly from retrieved chunks with `[doc_id]` citations, runs a deterministic verification confirming every cited `doc_id` appears in the retrieved set (`grounding_verified: bool`), and **never stores, caches, or logs** `X-LLM-API-Key`.
 
@@ -146,8 +146,8 @@ Provisions only the exact resources needed, with strict least privilege:
 ### `ci.yml` — Four Quality Gates + OIDC Code Deployment
 1. **Gate 1 — Static, SQL & Clean Wheel:** `ruff check`, `ruff format --check`, `mypy src`, `sqlfluff lint src/medcover/sql`, then `uv build` -> install `.whl` in a fresh venv -> `pytest`.
 2. **Gate 2 — Pipeline & Idempotency:** Run `medcover build` twice on `tests/fixtures/mcd_sample`; assert 2nd run reports `chunks_embedded == 0`; mutate 1 fixture doc and assert only its delta chunks re-embed.
-3. **Gate 3 — Data Contracts & Job Summary:** Run Pandera + `sql/dq_invariants.sql`; fail on violations or `quarantine_rate > 0.10`; publish a Markdown summary of `run_manifest.json` to `$GITHUB_STEP_SUMMARY`.
-4. **Gate 4 — GenAI Eval & Container Smoke:** Run `medcover eval` against `tests/eval_queries.json` (`Recall@5 >= 0.85`, `active_filter_violations == 0`); build `Dockerfile`, run against sample artifacts, and assert `GET /health` + `POST /retrieve` return `200`.
+3. **Gate 3 — Data Contracts & Job Summary:** Run Pandera + `sql/dq_invariants.sql`; fail on violations or `quarantine_rate > 0.10`; publish a Markdown summary of `run_manifest.json` + `eval_report.json` to `$GITHUB_STEP_SUMMARY`.
+4. **Gate 4 — GenAI Eval & Container Smoke:** Run `medcover eval` against `tests/eval_queries.json` (`Recall@5 >= 0.85`, `temporal_filter_violations == 0`); build `Dockerfile`, run against sample artifacts, and assert `GET /health` + `POST /retrieve` return `200`.
 5. **Deploy (`main` only, after Gates 1–4 pass):** Authenticate via **GitHub OIDC**, push `:<git-sha>` and `:latest` to ECR, deploy via `aws-actions/amazon-ecs-deploy-express-service@v1` (`cpu: 512`, `memory: 2048`, `container-port: 8000`, `health-check-path: /health`, `task-role-arn: medcoverTaskRole`), and run a live `/health` smoke check.
 
 ### `sync-mcd.yml` — Weekly Continuous Data Release

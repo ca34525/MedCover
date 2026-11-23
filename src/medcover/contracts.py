@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 DocType = Literal["NCD", "LCD", "ARTICLE"]
 PolicyStatus = Literal["ACTIVE", "RETIRED"]
 SourceMode = Literal["zip", "api"]
-CodeSystem = Literal["CPT", "HCPCS", "ICD10"]
+CodeSystem = Literal["HCPCS", "ICD10"]
 
 VALID_DOC_TYPES: frozenset[str] = frozenset(get_args(DocType))
 VALID_STATUSES: frozenset[str] = frozenset(get_args(PolicyStatus))
@@ -28,24 +28,26 @@ _CMS_US_DATE_FORMATS: tuple[str, ...] = (
 
 
 class RunManifest(BaseModel):
-    """Audit and lineage summary emitted alongside each Gold build and WAP release."""
+    """Immutable build provenance and lineage summary emitted alongside each Gold build."""
 
     run_id: str
     git_sha: str
     timestamp_utc: datetime
-    source_mode: SourceMode
+    source_modes: list[SourceMode] = Field(default_factory=list)
     bronze_docs: int = Field(ge=0)
     silver_docs: int = Field(ge=0)
     quarantined_docs: int = Field(ge=0)
-    quarantine_rate: float = Field(ge=0.0, le=1.0)
     gold_chunks: int = Field(ge=0)
     chunks_reused: int = Field(ge=0)
     chunks_embedded: int = Field(ge=0)
     token_p50: float = Field(ge=0.0)
     token_p95: float = Field(ge=0.0)
-    eval_recall_at_5: float | None = Field(default=None, ge=0.0, le=1.0)
-    eval_mrr: float | None = Field(default=None, ge=0.0, le=1.0)
-    active_filter_violations: int | None = Field(default=None, ge=0)
+
+    @property
+    def quarantine_rate(self) -> float:
+        """Fraction of processed documents routed to quarantine."""
+        total = self.silver_docs + self.quarantined_docs
+        return (self.quarantined_docs / total) if total > 0 else 0.0
 
 
 def parse_optional_str(value: Any) -> str | None:
@@ -197,14 +199,11 @@ SILVER_POLICIES_ARROW_SCHEMA = pyarrow.schema(
         pyarrow.field("version", pyarrow.int64(), nullable=False),
         pyarrow.field("title", pyarrow.string(), nullable=False),
         pyarrow.field("markdown_text", pyarrow.string(), nullable=False),
-        pyarrow.field("cpt_codes", pyarrow.list_(pyarrow.string()), nullable=False),
+        pyarrow.field("hcpcs_codes", pyarrow.list_(pyarrow.string()), nullable=False),
         pyarrow.field("icd10_codes", pyarrow.list_(pyarrow.string()), nullable=False),
         pyarrow.field("mac_jurisdiction", pyarrow.string(), nullable=True),
         pyarrow.field("effective_date", pyarrow.date32(), nullable=False),
         pyarrow.field("retired_date", pyarrow.date32(), nullable=True),
-        pyarrow.field("status", pyarrow.string(), nullable=False),
-        pyarrow.field("is_active", pyarrow.bool_(), nullable=False),
-        pyarrow.field("source_mode", pyarrow.string(), nullable=False),
         pyarrow.field("source_sha256", pyarrow.string(), nullable=False),
     ]
 )
@@ -231,7 +230,7 @@ def gold_chunks_arrow_schema(embedding_dim: int = 384) -> pyarrow.Schema:
 
     Inputs: expected fixed-size embedding vector dimension (default 384).
     Output grain: Arrow schema matching ``(doc_id, version, chunk_index)`` chunk rows.
-    Invariants: fixed-size ``float32[dim]`` vectors and list-typed CPT/ICD-10 code arrays.
+    Invariants: fixed-size ``float32[dim]`` vectors and list-typed HCPCS/ICD-10 code arrays.
     """
     return pyarrow.schema(
         [
@@ -245,12 +244,11 @@ def gold_chunks_arrow_schema(embedding_dim: int = 384) -> pyarrow.Schema:
             pyarrow.field("chunk_text", pyarrow.string(), nullable=False),
             pyarrow.field("token_count", pyarrow.int64(), nullable=False),
             pyarrow.field("chunk_sha256", pyarrow.string(), nullable=False),
-            pyarrow.field("cpt_codes", pyarrow.list_(pyarrow.string()), nullable=False),
+            pyarrow.field("hcpcs_codes", pyarrow.list_(pyarrow.string()), nullable=False),
             pyarrow.field("icd10_codes", pyarrow.list_(pyarrow.string()), nullable=False),
             pyarrow.field("mac_jurisdiction", pyarrow.string(), nullable=True),
             pyarrow.field("effective_date", pyarrow.date32(), nullable=False),
             pyarrow.field("retired_date", pyarrow.date32(), nullable=True),
-            pyarrow.field("is_active", pyarrow.bool_(), nullable=False),
             pyarrow.field(
                 "embedding", pyarrow.list_(pyarrow.float32(), embedding_dim), nullable=False
             ),
@@ -319,9 +317,9 @@ SILVER_POLICIES_SCHEMA = pa.DataFrameSchema(
             checks=pa.Check(_all_non_empty_strings, name="non_empty_markdown"),
             nullable=False,
         ),
-        "cpt_codes": pa.Column(
+        "hcpcs_codes": pa.Column(
             object,
-            checks=pa.Check(_all_string_lists, name="cpt_code_list"),
+            checks=pa.Check(_all_string_lists, name="hcpcs_code_list"),
             nullable=False,
         ),
         "icd10_codes": pa.Column(
@@ -332,17 +330,6 @@ SILVER_POLICIES_SCHEMA = pa.DataFrameSchema(
         "mac_jurisdiction": pa.Column(None, nullable=True),
         "effective_date": pa.Column(None, nullable=False),
         "retired_date": pa.Column(None, nullable=True),
-        "status": pa.Column(
-            str,
-            checks=pa.Check.isin(sorted(VALID_STATUSES)),
-            nullable=False,
-        ),
-        "is_active": pa.Column(bool, nullable=False),
-        "source_mode": pa.Column(
-            str,
-            checks=pa.Check.isin(sorted(VALID_SOURCE_MODES)),
-            nullable=False,
-        ),
         "source_sha256": pa.Column(str, nullable=False),
     },
     checks=pa.Check(_retired_not_before_effective, name="retired_gte_effective"),
@@ -377,7 +364,7 @@ def build_gold_chunks_schema(embedding_dim: int = 384) -> pa.DataFrameSchema:
 
     Inputs: expected vector dimension (default 384 for ``BAAI/bge-small-en-v1.5``).
     Output grain: Pandera ``DataFrameSchema`` enforcing unique ``(doc_id, version, chunk_index)``.
-    Invariants: non-empty chunk text, positive token count, fixed-dim non-null embeddings.
+    Invariants: non-empty chunk text, positive token count, valid date interval, fixed-dim vectors.
     """
     return pa.DataFrameSchema(
         columns={
@@ -404,9 +391,9 @@ def build_gold_chunks_schema(embedding_dim: int = 384) -> pa.DataFrameSchema:
             ),
             "token_count": pa.Column(int, checks=pa.Check.gt(0), nullable=False),
             "chunk_sha256": pa.Column(str, nullable=False),
-            "cpt_codes": pa.Column(
+            "hcpcs_codes": pa.Column(
                 object,
-                checks=pa.Check(_all_string_lists, name="cpt_code_list"),
+                checks=pa.Check(_all_string_lists, name="hcpcs_code_list"),
                 nullable=False,
             ),
             "icd10_codes": pa.Column(
@@ -417,7 +404,6 @@ def build_gold_chunks_schema(embedding_dim: int = 384) -> pa.DataFrameSchema:
             "mac_jurisdiction": pa.Column(None, nullable=True),
             "effective_date": pa.Column(None, nullable=False),
             "retired_date": pa.Column(None, nullable=True),
-            "is_active": pa.Column(bool, nullable=False),
             "embedding": pa.Column(
                 object,
                 checks=pa.Check(
@@ -432,6 +418,7 @@ def build_gold_chunks_schema(embedding_dim: int = 384) -> pa.DataFrameSchema:
                 nullable=False,
             ),
         },
+        checks=pa.Check(_retired_not_before_effective, name="retired_gte_effective"),
         strict=True,
         unique=["doc_id", "version", "chunk_index"],
     )

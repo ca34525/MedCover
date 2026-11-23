@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import duckdb
 import pandas as pd
@@ -21,6 +21,9 @@ from medcover.contracts import (
 )
 from medcover.sql import load_sql
 
+if TYPE_CHECKING:
+    from medcover.eval import EvalReport
+
 
 class AuditCheck(BaseModel):
     """Single Pandera, SQL invariant, or artifact consistency assertion outcome."""
@@ -37,10 +40,15 @@ class AuditReport(BaseModel):
     passed: bool
     silver_docs: int = Field(ge=0)
     quarantined_docs: int = Field(ge=0)
-    quarantine_rate: float = Field(ge=0.0, le=1.0)
     gold_chunks: int = Field(ge=0)
     checks: list[AuditCheck]
     manifest: RunManifest | None = None
+
+    @property
+    def quarantine_rate(self) -> float:
+        """Fraction of processed documents routed to quarantine."""
+        total = self.silver_docs + self.quarantined_docs
+        return (self.quarantined_docs / total) if total > 0 else 0.0
 
     @property
     def failed_checks(self) -> list[AuditCheck]:
@@ -74,8 +82,6 @@ def audit_medallion(settings: Settings) -> AuditReport:
     silver_docs = policies_table.num_rows
     quarantined_docs = quarantine_table.num_rows
     gold_chunks = chunks_table.num_rows
-    total_docs = silver_docs + quarantined_docs
-    quarantine_rate = (quarantined_docs / total_docs) if total_docs > 0 else 0.0
 
     checks: list[AuditCheck] = [
         _run_pandera_check("pandera_silver_policies", SILVER_POLICIES_SCHEMA, policies_table),
@@ -116,33 +122,33 @@ def audit_medallion(settings: Settings) -> AuditReport:
         passed=all(check.passed for check in checks),
         silver_docs=silver_docs,
         quarantined_docs=quarantined_docs,
-        quarantine_rate=round(quarantine_rate, 6),
         gold_chunks=gold_chunks,
         checks=checks,
         manifest=manifest,
     )
 
 
-def render_manifest_summary(manifest: RunManifest, audit: AuditReport | None = None) -> str:
-    """Format a RunManifest and optional AuditReport into GitHub-flavored Markdown.
+def render_manifest_summary(
+    manifest: RunManifest,
+    audit: AuditReport | None = None,
+    eval_report: EvalReport | None = None,
+) -> str:
+    """Format a RunManifest and optional AuditReport / EvalReport into GitHub-flavored Markdown.
 
-    Inputs: validated ``RunManifest`` and optional ``AuditReport``.
+    Inputs: immutable ``RunManifest`` plus optional ``AuditReport`` and ``EvalReport``.
     Output grain: single Markdown document suitable for ``$GITHUB_STEP_SUMMARY`` or logs.
     Invariants: deterministic formatting with explicit pass/fail audit status when provided.
     """
-    recall = f"{manifest.eval_recall_at_5:.3f}" if manifest.eval_recall_at_5 is not None else "n/a"
-    mrr = f"{manifest.eval_mrr:.3f}" if manifest.eval_mrr is not None else "n/a"
-    violations = (
-        str(manifest.active_filter_violations)
-        if manifest.active_filter_violations is not None
-        else "n/a"
-    )
+    source_modes = ", ".join(manifest.source_modes) if manifest.source_modes else "none"
+    recall = f"{eval_report.recall_at_5:.3f}" if eval_report is not None else "n/a"
+    mrr = f"{eval_report.mrr:.3f}" if eval_report is not None else "n/a"
+    violations = str(eval_report.temporal_filter_violations) if eval_report is not None else "n/a"
     lines = [
         f"## MedCover Run Summary (`{manifest.run_id}`)",
         "",
         "| Metric | Value |",
         "| --- | --- |",
-        f"| Source Mode | `{manifest.source_mode}` |",
+        f"| Source Modes | `{source_modes}` |",
         f"| Git SHA | `{manifest.git_sha}` |",
         f"| Bronze Docs | {manifest.bronze_docs} |",
         f"| Silver Docs | {manifest.silver_docs} |",
@@ -151,7 +157,7 @@ def render_manifest_summary(manifest: RunManifest, audit: AuditReport | None = N
         f"| Chunks Reused / Embedded | {manifest.chunks_reused} / {manifest.chunks_embedded} |",
         f"| Chunk Tokens (p50 / p95) | {manifest.token_p50} / {manifest.token_p95} |",
         f"| Eval Recall@5 / MRR | {recall} / {mrr} |",
-        f"| Active Filter Violations | {violations} |",
+        f"| Temporal Filter Violations | {violations} |",
     ]
     if audit is not None:
         status = "PASSED" if audit.passed else "FAILED"
@@ -213,6 +219,7 @@ def _check_gold_index_sync(
                 "SELECT COUNT(*) FROM duckdb_schemas() WHERE schema_name = 'fts_main_chunks'"
             ).fetchone()
             has_fts_index = bool(fts_row and int(fts_row[0]) > 0)
+            con.execute("SELECT COUNT(*) FROM active_chunks").fetchone()
     except duckdb.Error as exc:
         return AuditCheck(
             name="gold_index_sync",

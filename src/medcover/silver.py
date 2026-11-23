@@ -43,8 +43,6 @@ _SILVER_VALID_DOCS_SCHEMA = pa.schema(
         pa.field("mac_jurisdiction", pa.string()),
         pa.field("effective_date", pa.date32()),
         pa.field("retired_date", pa.date32()),
-        pa.field("status", pa.string()),
-        pa.field("source_mode", pa.string()),
         pa.field("source_sha256", pa.string()),
     ]
 )
@@ -62,10 +60,11 @@ class SilverResult:
 
     @property
     def quarantine_rate(self) -> float:
-        """Fraction of Bronze documents routed to quarantine."""
-        if self.bronze_docs == 0:
+        """Fraction of processed documents routed to quarantine."""
+        total = self.silver_docs + self.quarantined_docs
+        if total == 0:
             return 0.0
-        return self.quarantined_docs / self.bronze_docs
+        return self.quarantined_docs / total
 
 
 def html_to_markdown(raw_html: str | None) -> str:
@@ -98,7 +97,7 @@ def build_silver(settings: Settings) -> SilverResult:
 
     Inputs: ``Settings`` locating ``bronze_dir`` and ``silver_dir``.
     Output grain: ``silver/policies.parquet`` strictly 1 row per ``(doc_id, version)`` with
-    aggregated ``cpt_codes`` and ``icd10_codes`` arrays, plus ``silver/quarantine.parquet``.
+    aggregated ``hcpcs_codes`` and ``icd10_codes`` arrays, plus ``silver/quarantine.parquet``.
     Invariants: malformed documents never enter ``policies.parquet`` and always record an
     explicit ``failure_reason`` in ``quarantine.parquet``.
     """
@@ -204,8 +203,6 @@ def _partition_and_clean(
                 "mac_jurisdiction": mac_jurisdiction,
                 "effective_date": effective_date,
                 "retired_date": retired_date,
-                "status": status,
-                "source_mode": source_mode,
                 "source_sha256": source_sha256,
             }
         )
@@ -236,8 +233,10 @@ def _collect_failure_reasons(
         reasons.append("missing_title")
     if effective_date is None:
         reasons.append("missing_effective_date")
-    if not status or status not in VALID_STATUSES:
+    if status is not None and status not in VALID_STATUSES:
         reasons.append("invalid_status")
+    if status == "RETIRED" and retired_date is None:
+        reasons.append("retired_without_date")
     if not source_mode or source_mode not in VALID_SOURCE_MODES:
         reasons.append("invalid_source_mode")
     if retired_date is not None and effective_date is not None and retired_date < effective_date:

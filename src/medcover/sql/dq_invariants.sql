@@ -162,17 +162,13 @@ INNER JOIN silver_quarantine AS q
 UNION ALL
 
 SELECT
-    'gold_active_flag_consistency' AS check_name,
+    'gold_valid_dates' AS check_name,
     COUNT(*) AS violation_count,
-    'Gold chunks marked is_active with retired_date <= CURRENT_DATE or null flag' AS detail
+    'Rows with retired_date < effective_date in gold/chunks.parquet' AS detail
 FROM gold_chunks
 WHERE
-    is_active IS NULL
-    OR (
-        is_active
-        AND retired_date IS NOT NULL
-        AND retired_date <= CURRENT_DATE
-    )
+    retired_date IS NOT NULL
+    AND retired_date < effective_date
 
 UNION ALL
 

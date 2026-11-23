@@ -94,6 +94,7 @@ def test_bronze_reingest_replaces_obsolete_crosswalks(tmp_path: Path) -> None:
     ingest_zip_or_dir(updated_codes, settings.bronze_dir)
     codes_df = pd.read_parquet(settings.bronze_dir / "raw_code_crosswalks.parquet")
     l33822_codes = codes_df[(codes_df["doc_id"] == "L33822") & (codes_df["version"] == 12)]
+    assert list(l33822_codes["code_system"]) == ["HCPCS"]
     assert list(l33822_codes["code"]) == ["72148"]
 
 
@@ -108,7 +109,7 @@ def test_cms_bulk_lcd_columns_dates_and_unrecognized_archive(tmp_path: Path) -> 
         encoding="utf-8",
     )
     (cms_dir / "lcd_x_hcpc_code.csv").write_text(
-        "lcd_id,lcd_version,hcpc_code_id\n35391,3,72148\n35391,3,E0601\n",
+        "lcd_id,lcd_version,hcpc_code_id\n35391,3,72148\n35391,3,E0601\n35391,3,0042T\n",
         encoding="utf-8",
     )
 
@@ -126,8 +127,9 @@ def test_cms_bulk_lcd_columns_dates_and_unrecognized_archive(tmp_path: Path) -> 
     l35392 = docs_df[docs_df["doc_id"] == "L35392"].iloc[0]
     assert pd.isna(l35392["effective_date"])
     assert set(zip(codes_df["code_system"], codes_df["code"], strict=True)) == {
-        ("CPT", "72148"),
+        ("HCPCS", "72148"),
         ("HCPCS", "E0601"),
+        ("HCPCS", "0042T"),
     }
 
     unknown_csv = tmp_path / "unknown.csv"
@@ -166,6 +168,10 @@ def test_bronze_partial_bundle_preserves_other_family_crosswalks_and_rejects_gar
 
     l35399 = docs_df[docs_df["doc_id"] == "L35399"].iloc[0]
     assert pd.isna(l35399["effective_date"])
+
+    # CMS native NCD rows without a status column keep status as None (never fabricated).
+    ncd220 = docs_df[docs_df["doc_id"] == "NCD220.6"].iloc[0]
+    assert pd.isna(ncd220["status"])
 
     ncd_codes = codes_df[(codes_df["doc_id"] == "NCD220.6") & (codes_df["version"] == 2)]
     assert set(ncd_codes["code"]) >= {"78815", "78816", "C34.90"}

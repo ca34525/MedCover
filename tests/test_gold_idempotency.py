@@ -68,8 +68,8 @@ def test_chunk_markdown_mixed_prose_and_table_never_corrupts_table_overlap() -> 
     assert chunks[1].chunk_text.startswith("after0")
 
 
-def test_gold_deduplicates_intra_build_chunks_and_derives_api_source_mode(tmp_path: Path) -> None:
-    """Verify identical sections embed once per build and inherit api source_mode."""
+def test_gold_deduplicates_intra_build_chunks_and_records_source_modes(tmp_path: Path) -> None:
+    """Verify identical sections embed once per build and manifest records mixed source_modes."""
     api_csv = tmp_path / "api_versions.csv"
     body = '"<h2>Criteria</h2><p>Identical text.</p>"'
     api_csv.write_text(
@@ -89,10 +89,27 @@ def test_gold_deduplicates_intra_build_chunks_and_derives_api_source_mode(tmp_pa
         embed_fn=_deterministic_embed,
     )
 
-    assert gold_res.manifest.source_mode == "api"
+    assert gold_res.manifest.source_modes == ["api"]
     assert gold_res.manifest.gold_chunks == 2
     assert gold_res.manifest.chunks_embedded == 1
     assert gold_res.manifest.chunks_reused == 1
+
+    # Mixing a zip backfill doc alongside api docs reports both source modes honestly.
+    zip_csv = tmp_path / "zip_doc.csv"
+    zip_csv.write_text(
+        "doc_id,doc_type,version,title,mac_jurisdiction,effective_date,retired_date,status,raw_html\n"
+        f"L55556,LCD,1,Backfill Policy,Novitas,2023-01-01,,ACTIVE,{body}\n",
+        encoding="utf-8",
+    )
+    ingest_zip_or_dir(zip_csv, settings.bronze_dir, source_mode="zip")
+    mixed_silver = build_silver(settings)
+    mixed_gold = build_gold(
+        settings,
+        bronze_docs=mixed_silver.bronze_docs,
+        quarantined_docs=mixed_silver.quarantined_docs,
+        embed_fn=_deterministic_embed,
+    )
+    assert mixed_gold.manifest.source_modes == ["api", "zip"]
 
 
 def test_gold_idempotency_and_delta_reembed(tmp_path: Path) -> None:
@@ -139,8 +156,8 @@ def test_gold_idempotency_and_delta_reembed(tmp_path: Path) -> None:
         embed_fn=_deterministic_embed,
     )
     chunks_df = pd.read_parquet(third.chunks_path)
-    active_chunks = chunks_df[chunks_df["is_active"]]
-    assert active_chunks["retired_date"].isna().all()
+    assert "is_active" not in chunks_df.columns
+    assert "hcpcs_codes" in chunks_df.columns
     ncd_chunks = int((chunks_df["doc_id"] == "NCD190.15").sum())
 
     assert third.manifest.chunks_embedded > 0
@@ -182,7 +199,25 @@ def test_gold_index_duckdb_opens_readonly_with_fts_and_vectors(tmp_path: Path) -
             "FROM chunks ORDER BY dist ASC LIMIT 5",
             [query_vec],
         ).fetchall()
+        docs_2023 = {
+            row[0]
+            for row in con.execute(
+                "SELECT DISTINCT doc_id FROM chunks_as_of(DATE '2023-06-01')"
+            ).fetchall()
+        }
+        docs_2026 = {
+            row[0]
+            for row in con.execute(
+                "SELECT DISTINCT doc_id FROM chunks_as_of(DATE '2026-01-01')"
+            ).fetchall()
+        }
+        active_view_docs = {
+            row[0] for row in con.execute("SELECT DISTINCT doc_id FROM active_chunks").fetchall()
+        }
 
     assert len(fts_hits) > 0
     assert any(doc_id in {"L33822", "A56542"} for _, doc_id, _ in fts_hits)
     assert len(vec_hits) == 5
+    assert "L33381" in docs_2023
+    assert "L33381" not in docs_2026
+    assert "L33381" not in active_view_docs

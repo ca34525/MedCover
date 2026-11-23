@@ -9,28 +9,28 @@ WITH filtered AS (
         c.section_heading,
         c.chunk_text,
         c.token_count,
-        c.cpt_codes,
+        c.hcpcs_codes,
         c.icd10_codes,
         c.mac_jurisdiction,
         c.effective_date,
         c.retired_date,
-        c.is_active,
         c.embedding
     FROM chunks AS c
     CROSS JOIN search_params AS p
     WHERE
         (
-            NOT p.active_only
+            p.as_of_date IS NULL
             OR (
-                c.is_active
-                AND (c.retired_date IS NULL OR c.retired_date > CURRENT_DATE)
+                c.effective_date <= p.as_of_date
+                AND (c.retired_date IS NULL OR c.retired_date > p.as_of_date)
             )
         )
-        AND (p.cpt_code IS NULL OR LIST_CONTAINS(c.cpt_codes, UPPER(p.cpt_code)))
+        AND (p.hcpcs_code IS NULL OR LIST_CONTAINS(c.hcpcs_codes, UPPER(p.hcpcs_code)))
         AND (p.icd10_code IS NULL OR LIST_CONTAINS(c.icd10_codes, UPPER(p.icd10_code)))
         AND (p.doc_type IS NULL OR c.doc_type = UPPER(p.doc_type))
         AND (
             p.mac_jurisdiction IS NULL
+            OR c.doc_type = 'NCD'
             OR LOWER(COALESCE(c.mac_jurisdiction, '')) = LOWER(p.mac_jurisdiction)
         )
 ),
@@ -113,12 +113,11 @@ final_ranked AS (
         c.section_heading,
         c.chunk_text,
         c.token_count,
-        c.cpt_codes,
+        c.hcpcs_codes,
         c.icd10_codes,
         c.mac_jurisdiction,
         c.effective_date,
         c.retired_date,
-        c.is_active,
         f.bm25_score,
         f.bm25_rank,
         f.cosine_distance,
@@ -140,12 +139,11 @@ SELECT
     r.section_heading,
     r.chunk_text,
     r.token_count,
-    r.cpt_codes,
+    r.hcpcs_codes,
     r.icd10_codes,
     r.mac_jurisdiction,
     r.effective_date,
     r.retired_date,
-    r.is_active,
     r.bm25_score,
     r.bm25_rank,
     r.cosine_distance,

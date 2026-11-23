@@ -20,6 +20,7 @@ from fastembed import TextEmbedding
 
 from medcover.config import Settings
 from medcover.contracts import (
+    VALID_SOURCE_MODES,
     RunManifest,
     SourceMode,
     build_gold_chunks_schema,
@@ -114,17 +115,17 @@ def build_gold(
     *,
     bronze_docs: int | None = None,
     quarantined_docs: int | None = None,
-    source_mode: SourceMode | None = None,
+    source_modes: Sequence[SourceMode] | None = None,
     embed_fn: EmbedFn | None = None,
 ) -> GoldResult:
     """Chunk Silver policies, incrementally embed changed chunks, and build ``index.duckdb``.
 
-    Inputs: ``Settings`` plus optional Bronze/quarantine counts, source mode, and ``embed_fn``.
+    Inputs: ``Settings`` plus optional Bronze/quarantine counts, source modes, and ``embed_fn``.
     Output grain: ``gold/chunks.parquet`` unique on ``(doc_id, version, chunk_index)``,
-    pre-indexed ``gold/index.duckdb``, and ``gold/run_manifest.json``.
+    pre-indexed ``gold/index.duckdb``, and immutable ``gold/run_manifest.json``.
     Invariants: unchanged ``chunk_sha256`` vectors are reused from prior Gold (and deduplicated
     within the same build) so repeat runs yield ``chunks_embedded == 0``; ``index.duckdb`` is
-    built with FTS ready for read-only serving.
+    built with FTS and query-time temporal views ready for read-only serving.
     """
     policies_path = settings.silver_dir / "policies.parquet"
     if not policies_path.exists():
@@ -166,6 +167,7 @@ def build_gold(
         extension_dir=settings.resolved_duckdb_extension_dir(),
     )
 
+    bronze_docs_path = settings.bronze_dir / "raw_documents.parquet"
     silver_count = len(policies_rows)
     quarantine_count = (
         quarantined_docs
@@ -176,11 +178,10 @@ def build_gold(
         bronze_docs
         if bronze_docs is not None
         else _parquet_row_count(
-            settings.bronze_dir / "raw_documents.parquet",
+            bronze_docs_path,
             fallback=silver_count + quarantine_count,
         )
     )
-    quarantine_rate = (quarantine_count / bronze_count) if bronze_count > 0 else 0.0
 
     if chunks_df.empty:
         token_p50, token_p95 = 0.0, 0.0
@@ -191,18 +192,19 @@ def build_gold(
 
     now = datetime.now(tz=UTC)
     git_sha = _resolve_git_sha()
-    resolved_source_mode = (
-        source_mode if source_mode is not None else _resolve_source_mode(policies_rows)
+    resolved_source_modes: list[SourceMode] = (
+        sorted(set(source_modes))
+        if source_modes is not None
+        else _resolve_source_modes(bronze_docs_path)
     )
     manifest = RunManifest(
         run_id=f"{now.strftime('%Y%m%dT%H%M%SZ')}_{git_sha}",
         git_sha=git_sha,
         timestamp_utc=now,
-        source_mode=resolved_source_mode,
+        source_modes=resolved_source_modes,
         bronze_docs=bronze_count,
         silver_docs=silver_count,
         quarantined_docs=quarantine_count,
-        quarantine_rate=round(quarantine_rate, 6),
         gold_chunks=chunks_table.num_rows,
         chunks_reused=chunks_reused,
         chunks_embedded=chunks_embedded,
@@ -464,7 +466,7 @@ def _build_candidate_chunks(
         version = int(record["version"])
         title = str(record["title"])
         markdown_text = str(record["markdown_text"])
-        cpt_codes = [str(code) for code in record["cpt_codes"]]
+        hcpcs_codes = [str(code) for code in record["hcpcs_codes"]]
         icd10_codes = [str(code) for code in record["icd10_codes"]]
 
         doc_chunks = chunk_markdown(
@@ -493,12 +495,11 @@ def _build_candidate_chunks(
                     "chunk_text": chunk.chunk_text,
                     "token_count": chunk.token_count,
                     "chunk_sha256": chunk_sha256,
-                    "cpt_codes": cpt_codes,
+                    "hcpcs_codes": hcpcs_codes,
                     "icd10_codes": icd10_codes,
                     "mac_jurisdiction": record["mac_jurisdiction"],
                     "effective_date": record["effective_date"],
                     "retired_date": record["retired_date"],
-                    "is_active": bool(record["is_active"]),
                     "embedding_model": settings.embedding_model,
                 }
             )
@@ -617,6 +618,15 @@ def _build_duckdb_index(
             "'chunks', 'chunk_id', 'title', 'section_heading', 'chunk_text', "
             "stemmer='porter', stopwords='english', overwrite=1)"
         )
+        con.execute(
+            "CREATE OR REPLACE MACRO chunks_as_of(as_of_date) AS TABLE "
+            "SELECT * FROM chunks "
+            "WHERE effective_date <= as_of_date "
+            "AND (retired_date IS NULL OR retired_date > as_of_date)"
+        )
+        con.execute(
+            "CREATE OR REPLACE VIEW active_chunks AS SELECT * FROM chunks_as_of(CURRENT_DATE)"
+        )
 
     os.replace(tmp_path, index_path)
 
@@ -627,9 +637,16 @@ def _parquet_row_count(path: Path, *, fallback: int) -> int:
     return fallback
 
 
-def _resolve_source_mode(policies_rows: Sequence[dict[str, Any]]) -> SourceMode:
-    modes = {str(row["source_mode"]) for row in policies_rows}
-    return "api" if "api" in modes else "zip"
+def _resolve_source_modes(bronze_docs_path: Path) -> list[SourceMode]:
+    if not bronze_docs_path.exists():
+        return []
+    rows = pq.read_table(bronze_docs_path, columns=["source_mode"]).to_pylist()
+    modes: set[SourceMode] = set()
+    for row in rows:
+        value = row.get("source_mode")
+        if isinstance(value, str) and value in VALID_SOURCE_MODES:
+            modes.add("api" if value == "api" else "zip")
+    return sorted(modes)
 
 
 def _resolve_git_sha() -> str:
