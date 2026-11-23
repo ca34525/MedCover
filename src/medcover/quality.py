@@ -1,23 +1,23 @@
-"""Data quality audit (Pandera + dq_invariants.sql), quarantine threshold, and manifest summary."""
+"""Data quality audit (PyArrow schemas + dq_invariants.sql), quarantine cap, and summary."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import duckdb
-import pandas as pd
-import pandera.pandas as pa
 import pyarrow as arrow
 import pyarrow.parquet as pq
 from pydantic import BaseModel, Field
 
 from medcover.config import Settings
 from medcover.contracts import (
-    SILVER_POLICIES_SCHEMA,
-    SILVER_QUARANTINE_SCHEMA,
+    SILVER_POLICIES_ARROW_SCHEMA,
+    SILVER_QUARANTINE_ARROW_SCHEMA,
     RunManifest,
-    build_gold_chunks_schema,
+    gold_chunks_arrow_schema,
+    validate_arrow_table,
 )
 from medcover.sql import load_sql
 
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 
 class AuditCheck(BaseModel):
-    """Single Pandera, SQL invariant, or artifact consistency assertion outcome."""
+    """Single PyArrow contract, SQL invariant, or artifact consistency assertion outcome."""
 
     name: str
     passed: bool
@@ -57,7 +57,7 @@ class AuditReport(BaseModel):
 
 
 def audit_medallion(settings: Settings) -> AuditReport:
-    """Execute Pandera contracts, ``dq_invariants.sql``, and Gold index/manifest checks.
+    """Execute PyArrow schema contracts, ``dq_invariants.sql``, and Gold index/manifest checks.
 
     Inputs: ``Settings`` pointing to built Silver and Gold artifact directories.
     Output grain: single ``AuditReport`` summarizing every contract and SQL invariant check.
@@ -84,12 +84,22 @@ def audit_medallion(settings: Settings) -> AuditReport:
     gold_chunks = chunks_table.num_rows
 
     checks: list[AuditCheck] = [
-        _run_pandera_check("pandera_silver_policies", SILVER_POLICIES_SCHEMA, policies_table),
-        _run_pandera_check("pandera_silver_quarantine", SILVER_QUARANTINE_SCHEMA, quarantine_table),
-        _run_pandera_check(
-            "pandera_gold_chunks",
-            build_gold_chunks_schema(settings.embedding_dim),
+        _run_arrow_contract_check(
+            "arrow_silver_policies",
+            SILVER_POLICIES_ARROW_SCHEMA,
+            policies_table,
+            unique_keys=("doc_id", "version"),
+        ),
+        _run_arrow_contract_check(
+            "arrow_silver_quarantine",
+            SILVER_QUARANTINE_ARROW_SCHEMA,
+            quarantine_table,
+        ),
+        _run_arrow_contract_check(
+            "arrow_gold_chunks",
+            gold_chunks_arrow_schema(settings.embedding_dim),
             chunks_table,
+            unique_keys=("doc_id", "version", "chunk_index"),
         ),
         _check_gold_index_sync(
             index_path=index_path,
@@ -150,6 +160,7 @@ def render_manifest_summary(
         "| --- | --- |",
         f"| Source Modes | `{source_modes}` |",
         f"| Git SHA | `{manifest.git_sha}` |",
+        f"| DuckDB / Storage | `{manifest.duckdb_version}` / `{manifest.duckdb_storage_version}` |",
         f"| Bronze Docs | {manifest.bronze_docs} |",
         f"| Silver Docs | {manifest.silver_docs} |",
         f"| Quarantined Docs | {manifest.quarantined_docs} ({manifest.quarantine_rate:.2%}) |",
@@ -176,27 +187,23 @@ def render_manifest_summary(
     return "\n".join(lines) + "\n"
 
 
-def _run_pandera_check(
+def _run_arrow_contract_check(
     name: str,
-    schema: pa.DataFrameSchema,
+    expected_schema: arrow.Schema,
     table: arrow.Table,
+    *,
+    unique_keys: Sequence[str] = (),
 ) -> AuditCheck:
-    df: pd.DataFrame = table.to_pandas()
     try:
-        schema.validate(df, lazy=True)
-    except pa.errors.SchemaErrors as exc:
-        failure_count = max(1, len(exc.failure_cases))
-        first_case = exc.failure_cases.iloc[0].to_dict() if not exc.failure_cases.empty else {}
-        detail = f"Pandera contract failure: {first_case}"
-        return AuditCheck(name=name, passed=False, violation_count=failure_count, detail=detail)
-    except pa.errors.SchemaError as exc:
+        validate_arrow_table(table, expected_schema, unique_keys=unique_keys)
+    except ValueError as exc:
         return AuditCheck(name=name, passed=False, violation_count=1, detail=str(exc))
 
     return AuditCheck(
         name=name,
         passed=True,
         violation_count=0,
-        detail=f"Validated {len(df)} rows against {name}",
+        detail=f"Validated {table.num_rows} rows against {name}",
     )
 
 
@@ -270,7 +277,7 @@ def _run_sql_invariants(
         [
             {
                 "embedding_dim": settings.embedding_dim,
-                "max_chunk_tokens": settings.chunk_token_limit,
+                "max_chunk_tokens": settings.max_chunk_tokens,
                 "max_quarantine_rate": settings.max_quarantine_rate,
             }
         ],

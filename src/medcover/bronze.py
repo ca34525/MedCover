@@ -20,13 +20,14 @@ import pyarrow.parquet as pq
 from medcover.config import Settings
 from medcover.contracts import (
     BRONZE_CROSSWALKS_ARROW_SCHEMA,
-    BRONZE_CROSSWALKS_SCHEMA,
     BRONZE_DOCUMENTS_ARROW_SCHEMA,
-    BRONZE_DOCUMENTS_SCHEMA,
+    VALID_CODE_SYSTEMS,
+    VALID_SOURCE_MODES,
     SourceMode,
     parse_optional_date,
     parse_optional_int,
     parse_optional_str,
+    validate_arrow_table,
 )
 
 # CMS HTML policy cells can exceed the default 128 KB CSV field limit.
@@ -186,7 +187,8 @@ def ingest_zip_or_dir(
     ``raw_code_crosswalks.parquet`` code-link rows.
     Invariants: preserves historical versions via upsert on ``(doc_id, version)``, scopes
     crosswalk replacement to the document families whose crosswalk tables were ingested,
-    and validates output tables against Bronze Pandera contracts.
+    excludes non-covered ICD-10 crosswalk tables, and validates output tables against
+    Bronze PyArrow schema contracts.
     """
     ingested_at = datetime.now(tz=UTC)
     documents: list[dict[str, Any]] = []
@@ -201,6 +203,8 @@ def ingest_zip_or_dir(
             continue
         spec = _match_table_spec(headers)
         if spec is None:
+            continue
+        if spec.kind == "crosswalk" and "noncovered" in csv_name.lower():
             continue
         recognized_tables += 1
         if spec.kind == "crosswalk":
@@ -262,7 +266,11 @@ def write_bronze_tables(
 
     merged_docs = [docs_by_key[key] for key in sorted(docs_by_key)]
     docs_table = pa.Table.from_pylist(merged_docs, schema=BRONZE_DOCUMENTS_ARROW_SCHEMA)
-    BRONZE_DOCUMENTS_SCHEMA.validate(docs_table.to_pandas())
+    validate_arrow_table(
+        docs_table,
+        BRONZE_DOCUMENTS_ARROW_SCHEMA,
+        unique_keys=("doc_id", "version"),
+    )
     pq.write_table(docs_table, docs_path)
 
     incoming_codes = [_coerce_crosswalk_record(row) for row in crosswalks]
@@ -291,7 +299,7 @@ def write_bronze_tables(
         ),
     )
     codes_table = pa.Table.from_pylist(merged_codes, schema=BRONZE_CROSSWALKS_ARROW_SCHEMA)
-    BRONZE_CROSSWALKS_SCHEMA.validate(codes_table.to_pandas())
+    validate_arrow_table(codes_table, BRONZE_CROSSWALKS_ARROW_SCHEMA)
     pq.write_table(codes_table, codes_path)
 
     return BronzeResult(
@@ -537,8 +545,16 @@ def _normalize_crosswalk_rows(
 def _coerce_document_record(row: Mapping[str, Any]) -> dict[str, Any]:
     doc_id = parse_optional_str(row.get("doc_id"))
     version = parse_optional_int(row.get("version"))
-    if doc_id is None or version is None:
-        msg = f"Bronze document requires non-null doc_id and integer version: {row!r}"
+    if doc_id is None or version is None or version < 1:
+        msg = f"Bronze document requires non-null doc_id and version >= 1: {row!r}"
+        raise ValueError(msg)
+
+    source_mode = parse_optional_str(row.get("source_mode")) or "zip"
+    if source_mode not in VALID_SOURCE_MODES:
+        msg = (
+            f"Invalid Bronze source_mode {source_mode!r}; "
+            f"expected one of {sorted(VALID_SOURCE_MODES)}"
+        )
         raise ValueError(msg)
 
     raw_ingested = row.get("ingested_at")
@@ -559,7 +575,7 @@ def _coerce_document_record(row: Mapping[str, Any]) -> dict[str, Any]:
         "effective_date": parse_optional_date(row.get("effective_date")),
         "retired_date": parse_optional_date(row.get("retired_date")),
         "status": parse_optional_str(row.get("status")),
-        "source_mode": parse_optional_str(row.get("source_mode")) or "zip",
+        "source_mode": source_mode,
         "ingested_at": ingested_at,
     }
     record["source_sha256"] = parse_optional_str(row.get("source_sha256")) or (
@@ -573,10 +589,16 @@ def _coerce_crosswalk_record(row: Mapping[str, Any]) -> dict[str, Any]:
     version = parse_optional_int(row.get("version"))
     code_system = parse_optional_str(row.get("code_system"))
     code = parse_optional_str(row.get("code"))
-    if not (doc_id and version is not None and code_system and code):
-        msg = f"Bronze crosswalk requires doc_id, version, code_system, and code: {row!r}"
+    if not (doc_id and version is not None and version >= 1 and code_system and code):
+        msg = f"Bronze crosswalk requires doc_id, version >= 1, code_system, and code: {row!r}"
         raise ValueError(msg)
     normalized_system = _CODE_SYSTEM_MAP.get(code_system.upper(), code_system.upper())
+    if normalized_system not in VALID_CODE_SYSTEMS:
+        msg = (
+            f"Invalid Bronze code_system {normalized_system!r}; "
+            f"expected one of {sorted(VALID_CODE_SYSTEMS)}"
+        )
+        raise ValueError(msg)
     return {
         "doc_id": doc_id,
         "version": version,

@@ -1,12 +1,12 @@
-"""Canonical Arrow schemas, Pandera contracts, RunManifest, and scalar parsers."""
+"""Canonical PyArrow schema contracts, RunManifest, Arrow validators, and scalar parsers."""
 
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
 from datetime import date, datetime
 from typing import Any, Literal, get_args
 
-import pandas as pd
-import pandera.pandas as pa
 import pyarrow
 from pydantic import BaseModel, Field
 
@@ -34,6 +34,8 @@ class RunManifest(BaseModel):
     git_sha: str
     timestamp_utc: datetime
     source_modes: list[SourceMode] = Field(default_factory=list)
+    duckdb_version: str
+    duckdb_storage_version: str
     bronze_docs: int = Field(ge=0)
     silver_docs: int = Field(ge=0)
     quarantined_docs: int = Field(ge=0)
@@ -53,9 +55,9 @@ class RunManifest(BaseModel):
 def parse_optional_str(value: Any) -> str | None:
     """Normalize a nullable value to a stripped non-empty string or ``None``.
 
-    Inputs: arbitrary scalar from CSV, Parquet, Arrow, or Pandas.
+    Inputs: arbitrary scalar from CSV, Parquet, or Arrow.
     Output grain: single ``str | None``.
-    Invariants: treats ``None``, ``pd.NaT``, ``NaN``, and blank strings as ``None``.
+    Invariants: treats ``None``, ``NaN``, and blank strings as ``None``.
     """
     if _is_missing(value):
         return None
@@ -66,7 +68,7 @@ def parse_optional_str(value: Any) -> str | None:
 def parse_optional_int(value: Any) -> int | None:
     """Parse a nullable integer without raising on malformed strings.
 
-    Inputs: arbitrary scalar from CSV, Parquet, Arrow, or Pandas.
+    Inputs: arbitrary scalar from CSV, Parquet, or Arrow.
     Output grain: single ``int | None``.
     Invariants: rejects booleans, non-integral floats, and non-numeric strings as ``None``.
     """
@@ -88,14 +90,12 @@ def parse_optional_int(value: Any) -> int | None:
 def parse_optional_date(value: Any) -> date | None:
     """Strictly parse ISO-8601 or CMS US date/datetime strings into ``datetime.date``.
 
-    Inputs: nullable ``date``, ``datetime``, ``pd.Timestamp``, or string.
+    Inputs: nullable ``date``, ``datetime``, or string.
     Output grain: single ``date | None``.
     Invariants: rejects trailing garbage and malformed dates by returning ``None``.
     """
     if _is_missing(value):
         return None
-    if isinstance(value, pd.Timestamp):
-        return value.date()
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
@@ -119,51 +119,53 @@ def parse_optional_date(value: Any) -> date | None:
     return None
 
 
-def _is_missing(value: Any) -> bool:
-    if value is None or value is pd.NaT:
-        return True
-    if isinstance(value, float) and bool(pd.isna(value)):
-        return True
-    return isinstance(value, pd.Timestamp) and bool(pd.isna(value))
+def validate_arrow_table(
+    table: pyarrow.Table,
+    expected_schema: pyarrow.Schema,
+    *,
+    unique_keys: Sequence[str] = (),
+) -> None:
+    """Validate an Arrow table strictly against a canonical schema, nullability, and key grain.
 
+    Inputs: ``pyarrow.Table``, canonical ``pyarrow.Schema``, and optional composite key columns.
+    Output grain: returns ``None`` on success; raises ``ValueError`` with concrete mismatch details.
+    Invariants: zero Pandas conversion; enforces exact column set/order, Arrow types, non-null
+    field constraints, and unique composite keys when provided.
+    """
+    actual_names = table.schema.names
+    expected_names = expected_schema.names
+    if actual_names != expected_names:
+        msg = f"Schema column mismatch: expected {expected_names}, got {actual_names}"
+        raise ValueError(msg)
 
-def _all_non_empty_strings(series: pd.Series[Any]) -> bool:
-    return bool(series.map(lambda value: isinstance(value, str) and bool(value.strip())).all())
-
-
-def _all_string_lists(series: pd.Series[Any]) -> bool:
-    return bool(
-        series.map(
-            lambda value: (
-                (
-                    isinstance(value, (list, tuple))
-                    or (hasattr(value, "tolist") and isinstance(value.tolist(), list))
-                )
-                and all(isinstance(item, str) for item in list(value))
+    for expected_field in expected_schema:
+        actual_field = table.schema.field(expected_field.name)
+        if actual_field.type != expected_field.type:
+            msg = (
+                f"Column '{expected_field.name}' type mismatch: "
+                f"expected {expected_field.type}, got {actual_field.type}"
             )
-        ).all()
-    )
+            raise ValueError(msg)
+        if not expected_field.nullable:
+            null_count = table.column(expected_field.name).null_count
+            if null_count > 0:
+                msg = f"Non-nullable column '{expected_field.name}' contains {null_count} null(s)"
+                raise ValueError(msg)
+
+    if unique_keys and table.num_rows > 1:
+        key_columns = [table.column(col).to_pylist() for col in unique_keys]
+        seen: set[tuple[Any, ...]] = set()
+        for key in zip(*key_columns, strict=True):
+            if key in seen:
+                msg = f"Duplicate grain key on {tuple(unique_keys)}: {key!r}"
+                raise ValueError(msg)
+            seen.add(key)
 
 
-def _valid_embedding_vectors(series: pd.Series[Any], dim: int) -> bool:
-    for value in series:
-        vec = value.tolist() if hasattr(value, "tolist") else value
-        if not isinstance(vec, list) or len(vec) != dim:
-            return False
-        if any(item is None or item != item for item in vec):
-            return False
-    return True
-
-
-def _retired_not_before_effective(df: pd.DataFrame) -> bool:
-    if df.empty:
+def _is_missing(value: Any) -> bool:
+    if value is None:
         return True
-    mask = df["retired_date"].notna() & df["effective_date"].notna()
-    if not mask.any():
-        return True
-    retired = pd.to_datetime(df.loc[mask, "retired_date"]).dt.date
-    effective = pd.to_datetime(df.loc[mask, "effective_date"]).dt.date
-    return bool((retired >= effective).all())
+    return isinstance(value, float) and math.isnan(value)
 
 
 BRONZE_DOCUMENTS_ARROW_SCHEMA = pyarrow.schema(
@@ -204,6 +206,7 @@ SILVER_POLICIES_ARROW_SCHEMA = pyarrow.schema(
         pyarrow.field("mac_jurisdiction", pyarrow.string(), nullable=True),
         pyarrow.field("effective_date", pyarrow.date32(), nullable=False),
         pyarrow.field("retired_date", pyarrow.date32(), nullable=True),
+        pyarrow.field("valid_to", pyarrow.date32(), nullable=True),
         pyarrow.field("source_sha256", pyarrow.string(), nullable=False),
     ]
 )
@@ -230,7 +233,7 @@ def gold_chunks_arrow_schema(embedding_dim: int = 384) -> pyarrow.Schema:
 
     Inputs: expected fixed-size embedding vector dimension (default 384).
     Output grain: Arrow schema matching ``(doc_id, version, chunk_index)`` chunk rows.
-    Invariants: fixed-size ``float32[dim]`` vectors and list-typed HCPCS/ICD-10 code arrays.
+    Invariants: fixed-size ``float32[dim]`` vectors, ``valid_to`` SCD2 bound, and list code arrays.
     """
     return pyarrow.schema(
         [
@@ -249,176 +252,10 @@ def gold_chunks_arrow_schema(embedding_dim: int = 384) -> pyarrow.Schema:
             pyarrow.field("mac_jurisdiction", pyarrow.string(), nullable=True),
             pyarrow.field("effective_date", pyarrow.date32(), nullable=False),
             pyarrow.field("retired_date", pyarrow.date32(), nullable=True),
+            pyarrow.field("valid_to", pyarrow.date32(), nullable=True),
             pyarrow.field(
                 "embedding", pyarrow.list_(pyarrow.float32(), embedding_dim), nullable=False
             ),
             pyarrow.field("embedding_model", pyarrow.string(), nullable=False),
         ]
-    )
-
-
-BRONZE_DOCUMENTS_SCHEMA = pa.DataFrameSchema(
-    columns={
-        "doc_id": pa.Column(str, nullable=False),
-        "doc_type": pa.Column(None, nullable=True),
-        "version": pa.Column(int, checks=pa.Check.ge(1), nullable=False),
-        "title": pa.Column(None, nullable=True),
-        "raw_html": pa.Column(None, nullable=True),
-        "mac_jurisdiction": pa.Column(None, nullable=True),
-        "effective_date": pa.Column(None, nullable=True),
-        "retired_date": pa.Column(None, nullable=True),
-        "status": pa.Column(None, nullable=True),
-        "source_mode": pa.Column(
-            str,
-            checks=pa.Check.isin(sorted(VALID_SOURCE_MODES)),
-            nullable=False,
-        ),
-        "ingested_at": pa.Column(None, nullable=False),
-        "source_sha256": pa.Column(str, nullable=False),
-    },
-    strict=True,
-    unique=["doc_id", "version"],
-)
-
-BRONZE_CROSSWALKS_SCHEMA = pa.DataFrameSchema(
-    columns={
-        "doc_id": pa.Column(str, nullable=False),
-        "version": pa.Column(int, checks=pa.Check.ge(1), nullable=False),
-        "code_system": pa.Column(
-            str,
-            checks=pa.Check.isin(sorted(VALID_CODE_SYSTEMS)),
-            nullable=False,
-        ),
-        "code": pa.Column(str, nullable=False),
-    },
-    strict=True,
-)
-
-SILVER_POLICIES_SCHEMA = pa.DataFrameSchema(
-    columns={
-        "doc_id": pa.Column(
-            str,
-            checks=pa.Check(_all_non_empty_strings, name="non_empty_doc_id"),
-            nullable=False,
-        ),
-        "doc_type": pa.Column(
-            str,
-            checks=pa.Check.isin(sorted(VALID_DOC_TYPES)),
-            nullable=False,
-        ),
-        "version": pa.Column(int, checks=pa.Check.ge(1), nullable=False),
-        "title": pa.Column(
-            str,
-            checks=pa.Check(_all_non_empty_strings, name="non_empty_title"),
-            nullable=False,
-        ),
-        "markdown_text": pa.Column(
-            str,
-            checks=pa.Check(_all_non_empty_strings, name="non_empty_markdown"),
-            nullable=False,
-        ),
-        "hcpcs_codes": pa.Column(
-            object,
-            checks=pa.Check(_all_string_lists, name="hcpcs_code_list"),
-            nullable=False,
-        ),
-        "icd10_codes": pa.Column(
-            object,
-            checks=pa.Check(_all_string_lists, name="icd10_code_list"),
-            nullable=False,
-        ),
-        "mac_jurisdiction": pa.Column(None, nullable=True),
-        "effective_date": pa.Column(None, nullable=False),
-        "retired_date": pa.Column(None, nullable=True),
-        "source_sha256": pa.Column(str, nullable=False),
-    },
-    checks=pa.Check(_retired_not_before_effective, name="retired_gte_effective"),
-    strict=True,
-    unique=["doc_id", "version"],
-)
-
-SILVER_QUARANTINE_SCHEMA = pa.DataFrameSchema(
-    columns={
-        "doc_id": pa.Column(None, nullable=True),
-        "doc_type": pa.Column(None, nullable=True),
-        "version": pa.Column(None, nullable=True),
-        "title": pa.Column(None, nullable=True),
-        "effective_date": pa.Column(None, nullable=True),
-        "retired_date": pa.Column(None, nullable=True),
-        "status": pa.Column(None, nullable=True),
-        "source_mode": pa.Column(None, nullable=True),
-        "source_sha256": pa.Column(None, nullable=True),
-        "failure_reason": pa.Column(
-            None,
-            checks=pa.Check(_all_non_empty_strings, name="non_empty_failure_reason"),
-            nullable=False,
-        ),
-        "quarantined_at": pa.Column(None, nullable=False),
-    },
-    strict=True,
-)
-
-
-def build_gold_chunks_schema(embedding_dim: int = 384) -> pa.DataFrameSchema:
-    """Build the Pandera contract for ``gold/chunks.parquet``.
-
-    Inputs: expected vector dimension (default 384 for ``BAAI/bge-small-en-v1.5``).
-    Output grain: Pandera ``DataFrameSchema`` enforcing unique ``(doc_id, version, chunk_index)``.
-    Invariants: non-empty chunk text, positive token count, valid date interval, fixed-dim vectors.
-    """
-    return pa.DataFrameSchema(
-        columns={
-            "chunk_id": pa.Column(
-                str,
-                checks=pa.Check(_all_non_empty_strings, name="non_empty_chunk_id"),
-                nullable=False,
-                unique=True,
-            ),
-            "doc_id": pa.Column(str, nullable=False),
-            "doc_type": pa.Column(
-                str,
-                checks=pa.Check.isin(sorted(VALID_DOC_TYPES)),
-                nullable=False,
-            ),
-            "version": pa.Column(int, checks=pa.Check.ge(1), nullable=False),
-            "chunk_index": pa.Column(int, checks=pa.Check.ge(0), nullable=False),
-            "title": pa.Column(str, nullable=False),
-            "section_heading": pa.Column(str, nullable=False),
-            "chunk_text": pa.Column(
-                str,
-                checks=pa.Check(_all_non_empty_strings, name="non_empty_chunk_text"),
-                nullable=False,
-            ),
-            "token_count": pa.Column(int, checks=pa.Check.gt(0), nullable=False),
-            "chunk_sha256": pa.Column(str, nullable=False),
-            "hcpcs_codes": pa.Column(
-                object,
-                checks=pa.Check(_all_string_lists, name="hcpcs_code_list"),
-                nullable=False,
-            ),
-            "icd10_codes": pa.Column(
-                object,
-                checks=pa.Check(_all_string_lists, name="icd10_code_list"),
-                nullable=False,
-            ),
-            "mac_jurisdiction": pa.Column(None, nullable=True),
-            "effective_date": pa.Column(None, nullable=False),
-            "retired_date": pa.Column(None, nullable=True),
-            "embedding": pa.Column(
-                object,
-                checks=pa.Check(
-                    lambda series: _valid_embedding_vectors(series, embedding_dim),
-                    name=f"embedding_dim_{embedding_dim}",
-                ),
-                nullable=False,
-            ),
-            "embedding_model": pa.Column(
-                str,
-                checks=pa.Check(_all_non_empty_strings, name="non_empty_model"),
-                nullable=False,
-            ),
-        },
-        checks=pa.Check(_retired_not_before_effective, name="retired_gte_effective"),
-        strict=True,
-        unique=["doc_id", "version", "chunk_index"],
     )

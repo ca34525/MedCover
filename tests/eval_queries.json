@@ -135,5 +135,12 @@
     "expected_doc_ids": ["L33381"],
     "hcpcs_code": "43644",
     "as_of_date": "2023-06-01"
+  },
+  {
+    "query_id": "q21_lumbar_mri_v11_point_in_time_2021",
+    "query": "Lumbar spine MRI 4 weeks conservative therapy prior to 2022 revision",
+    "expected_doc_ids": ["L33822"],
+    "hcpcs_code": "72148",
+    "as_of_date": "2021-06-01"
   }
 ]

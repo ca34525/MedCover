@@ -1,13 +1,12 @@
-"""Tests for Silver quarantine routing and Gold/Silver data quality audit invariants."""
+"""Tests for Silver quarantine routing and Gold/Silver Arrow + SQL data quality audit."""
 
 from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -32,15 +31,15 @@ def test_malformed_fixture_routed_to_quarantine(tmp_path: Path) -> None:
     ingest_sample_fixtures(settings)
     silver_res = build_silver(settings)
 
-    quarantine_df = pd.read_parquet(silver_res.quarantine_path)
-    policies_df = pd.read_parquet(silver_res.policies_path)
+    quarantine = pq.read_table(silver_res.quarantine_path).to_pylist()
+    policies = pq.read_table(silver_res.policies_path).to_pylist()
 
-    assert len(quarantine_df) == 1
-    row = quarantine_df.iloc[0]
+    assert len(quarantine) == 1
+    row = quarantine[0]
     assert row["doc_id"] == "L99999"
     assert "retired_date_before_effective_date" in str(row["failure_reason"])
     assert "empty_cleaned_text" in str(row["failure_reason"])
-    assert "L99999" not in set(policies_df["doc_id"])
+    assert "L99999" not in {item["doc_id"] for item in policies}
     assert silver_res.quarantine_rate <= settings.max_quarantine_rate
 
 
@@ -63,12 +62,12 @@ def test_missing_title_date_inversion_and_retired_without_date_quarantined(
     ingest_zip_or_dir(bad_csv, settings.bronze_dir)
     silver_res = build_silver(settings)
 
-    quarantine_df = pd.read_parquet(silver_res.quarantine_path)
-    policies_df = pd.read_parquet(silver_res.policies_path)
+    quarantine = pq.read_table(silver_res.quarantine_path).to_pylist()
+    policies = pq.read_table(silver_res.policies_path).to_pylist()
 
-    assert set(policies_df["doc_id"]) == {"L33333", "L33334"}
-    assert len(quarantine_df) == 3
-    reasons = dict(zip(quarantine_df["doc_id"], quarantine_df["failure_reason"], strict=True))
+    assert {item["doc_id"] for item in policies} == {"L33333", "L33334"}
+    assert len(quarantine) == 3
+    reasons = {item["doc_id"]: item["failure_reason"] for item in quarantine}
     assert "missing_title" in reasons["L11111"]
     assert "retired_date_before_effective_date" in reasons["L22222"]
     assert "retired_without_date" in reasons["L22223"]
@@ -76,10 +75,10 @@ def test_missing_title_date_inversion_and_retired_without_date_quarantined(
 
 
 def test_all_quarantined_batch_and_malformed_bronze_strings(tmp_path: Path) -> None:
-    """Verify 0-valid-row batches pass Silver and Gold Pandera/Arrow contracts cleanly."""
+    """Verify 0-valid-row batches pass Silver and Gold Arrow contracts cleanly."""
     settings = Settings(data_dir=tmp_path)
     settings.bronze_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
+    raw_bad_table = pa.Table.from_pylist(
         [
             {
                 "doc_id": "L44444",
@@ -92,18 +91,19 @@ def test_all_quarantined_batch_and_malformed_bronze_strings(tmp_path: Path) -> N
                 "retired_date": None,
                 "status": "ACTIVE",
                 "source_mode": "zip",
-                "ingested_at": pd.Timestamp("2025-01-01T00:00:00Z"),
+                "ingested_at": datetime(2025, 1, 1, tzinfo=UTC),
                 "source_sha256": "a" * 64,
             }
         ]
-    ).to_parquet(settings.bronze_dir / "raw_documents.parquet", index=False)
+    )
+    pq.write_table(raw_bad_table, settings.bronze_dir / "raw_documents.parquet")
 
     silver_res = build_silver(settings)
     assert silver_res.silver_docs == 0
     assert silver_res.quarantined_docs == 1
 
-    quarantine_df = pd.read_parquet(silver_res.quarantine_path)
-    reason = str(quarantine_df.iloc[0]["failure_reason"])
+    quarantine = pq.read_table(silver_res.quarantine_path).to_pylist()
+    reason = str(quarantine[0]["failure_reason"])
     assert "invalid_version" in reason
     assert "missing_effective_date" in reason
 
@@ -119,7 +119,7 @@ def test_all_quarantined_batch_and_malformed_bronze_strings(tmp_path: Path) -> N
 
 
 def test_audit_medallion_passes_on_sample_build(tmp_path: Path) -> None:
-    """Verify full Pandera + dq_invariants.sql + FTS index audit passes on sample build."""
+    """Verify full Arrow + dq_invariants.sql + FTS index audit passes on sample build."""
     settings = Settings(data_dir=tmp_path)
     ingest_sample_fixtures(settings)
     silver_res = build_silver(settings)
@@ -133,14 +133,47 @@ def test_audit_medallion_passes_on_sample_build(tmp_path: Path) -> None:
     report = audit_medallion(settings)
     assert report.passed is True
     assert report.failed_checks == []
-    assert report.silver_docs == 14
+    assert report.silver_docs == 15
     assert report.quarantined_docs == 1
     assert report.quarantine_rate <= settings.max_quarantine_rate
     assert report.manifest is not None
 
     summary = render_manifest_summary(report.manifest, report)
     assert "Data Quality Audit: PASSED" in summary
+    assert "DuckDB / Storage" in summary
     assert "`gold_valid_embeddings`" in summary
+    assert "`silver_no_overlapping_versions`" in summary
+
+
+def test_audit_medallion_allows_wide_table_row_within_hard_token_cap(tmp_path: Path) -> None:
+    """Verify chunks between soft chunk_token_limit (450) and hard max_chunk_tokens (900) pass."""
+    wide_cell = " ".join(f"criteria{i}" for i in range(470))
+    wide_csv = tmp_path / "wide_table.csv"
+    wide_csv.write_text(
+        "doc_id,doc_type,version,title,mac_jurisdiction,effective_date,retired_date,status,raw_html\n"
+        "L66666,LCD,1,Wide Table Policy,Novitas,2024-01-01,,ACTIVE,"
+        f'"<h1>Wide Table</h1><table><thead><tr><th>Code</th><th>Rule</th></tr></thead>'
+        f'<tbody><tr><td>72148</td><td>{wide_cell}</td></tr></tbody></table>"\n',
+        encoding="utf-8",
+    )
+
+    settings = Settings(data_dir=tmp_path)
+    ingest_zip_or_dir(wide_csv, settings.bronze_dir)
+    silver_res = build_silver(settings)
+    gold_res = build_gold(
+        settings,
+        bronze_docs=silver_res.bronze_docs,
+        quarantined_docs=silver_res.quarantined_docs,
+        embed_fn=_deterministic_embed,
+    )
+    chunks = pq.read_table(gold_res.chunks_path).to_pylist()
+    assert any(
+        settings.chunk_token_limit < row["token_count"] <= settings.max_chunk_tokens
+        for row in chunks
+    )
+
+    report = audit_medallion(settings)
+    assert report.passed is True
 
 
 def test_audit_medallion_fails_when_quarantine_rate_exceeds_threshold(tmp_path: Path) -> None:
@@ -171,7 +204,7 @@ def test_audit_medallion_fails_when_quarantine_rate_exceeds_threshold(tmp_path: 
 
 
 def test_audit_medallion_catches_gold_sql_and_date_violations(tmp_path: Path) -> None:
-    """Verify dq_invariants.sql catches duplicates, empty text, NaN vectors, and inverted dates."""
+    """Verify Arrow + dq_invariants.sql catch duplicates, empty text, NaN vectors, and bad dates."""
     settings = Settings(data_dir=tmp_path)
     ingest_sample_fixtures(settings)
     silver_res = build_silver(settings)
@@ -186,9 +219,10 @@ def test_audit_medallion_catches_gold_sql_and_date_violations(tmp_path: Path) ->
     rows = table.to_pylist()
     corrupted = dict(rows[0])
     corrupted["chunk_text"] = "   "
-    corrupted["token_count"] = settings.chunk_token_limit + 50
+    corrupted["token_count"] = settings.max_chunk_tokens + 50
     corrupted["effective_date"] = date(2025, 1, 1)
     corrupted["retired_date"] = date(2020, 1, 1)
+    corrupted["valid_to"] = date(2020, 1, 1)
     bad_vec = list(corrupted["embedding"])
     bad_vec[0] = float("nan")
     corrupted["embedding"] = bad_vec
@@ -200,7 +234,7 @@ def test_audit_medallion_catches_gold_sql_and_date_violations(tmp_path: Path) ->
     assert report.passed is False
     failed_names = {check.name for check in report.failed_checks}
     expected_failures = {
-        "pandera_gold_chunks",
+        "arrow_gold_chunks",
         "gold_index_sync",
         "gold_unique_grain",
         "gold_unique_chunk_id",

@@ -8,7 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Pipeline paths, thresholds, embedding parameters, and S3 release targets."""
+    """Pipeline paths, thresholds, embedding parameters, DuckDB bounds, and S3 release targets."""
 
     model_config = SettingsConfigDict(
         env_prefix="MEDCOVER_",
@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     eval_queries_path: Path = Field(default=Path("tests/eval_queries.json"))
 
     duckdb_extension_dir: Path | None = Field(default=None)
+    duckdb_storage_version: str = Field(default="v1.5.0")
+    duckdb_memory_limit: str = Field(default="1GB")
+    duckdb_threads: int = Field(default=2, ge=1)
     fastembed_cache_dir: Path | None = Field(default=None)
 
     s3_bucket: str | None = Field(default=None)
@@ -33,6 +36,7 @@ class Settings(BaseSettings):
     embedding_dim: int = Field(default=384, ge=1)
     chunk_token_limit: int = Field(default=450, ge=32)
     chunk_token_overlap: int = Field(default=60, ge=0)
+    max_chunk_tokens: int = Field(default=900, ge=32)
 
     max_quarantine_rate: float = Field(default=0.10, ge=0.0, le=1.0)
     min_recall_at_5: float = Field(default=0.85, ge=0.0, le=1.0)
@@ -59,10 +63,16 @@ class Settings(BaseSettings):
         return self.data_dir / "releases"
 
     @model_validator(mode="after")
-    def _validate_chunk_overlap(self) -> Self:
+    def _validate_chunk_limits(self) -> Self:
         if self.chunk_token_overlap >= self.chunk_token_limit:
             msg = (
                 f"chunk_token_overlap ({self.chunk_token_overlap}) must be less than "
+                f"chunk_token_limit ({self.chunk_token_limit})"
+            )
+            raise ValueError(msg)
+        if self.max_chunk_tokens < self.chunk_token_limit:
+            msg = (
+                f"max_chunk_tokens ({self.max_chunk_tokens}) must be greater than or equal to "
                 f"chunk_token_limit ({self.chunk_token_limit})"
             )
             raise ValueError(msg)
@@ -89,6 +99,6 @@ def get_settings() -> Settings:
 
     Inputs: environment variables prefixed with ``MEDCOVER_`` and optional ``.env``.
     Output grain: single validated ``Settings`` instance.
-    Invariants: ``chunk_token_overlap`` is strictly smaller than ``chunk_token_limit``.
+    Invariants: ``chunk_token_overlap < chunk_token_limit <= max_chunk_tokens``.
     """
     return Settings()

@@ -7,7 +7,8 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import duckdb
-import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from medcover.bronze import ingest_sample_fixtures, ingest_zip_or_dir
 from medcover.config import Settings
@@ -68,8 +69,8 @@ def test_chunk_markdown_mixed_prose_and_table_never_corrupts_table_overlap() -> 
     assert chunks[1].chunk_text.startswith("after0")
 
 
-def test_gold_deduplicates_intra_build_chunks_and_records_source_modes(tmp_path: Path) -> None:
-    """Verify identical sections embed once per build and manifest records mixed source_modes."""
+def test_gold_deduplicates_intra_build_chunks_and_records_provenance(tmp_path: Path) -> None:
+    """Verify identical sections embed once per build and manifest records DuckDB & source modes."""
     api_csv = tmp_path / "api_versions.csv"
     body = '"<h2>Criteria</h2><p>Identical text.</p>"'
     api_csv.write_text(
@@ -90,6 +91,8 @@ def test_gold_deduplicates_intra_build_chunks_and_records_source_modes(tmp_path:
     )
 
     assert gold_res.manifest.source_modes == ["api"]
+    assert gold_res.manifest.duckdb_version == duckdb.__version__
+    assert gold_res.manifest.duckdb_storage_version == settings.duckdb_storage_version
     assert gold_res.manifest.gold_chunks == 2
     assert gold_res.manifest.chunks_embedded == 1
     assert gold_res.manifest.chunks_reused == 1
@@ -140,13 +143,15 @@ def test_gold_idempotency_and_delta_reembed(tmp_path: Path) -> None:
 
     # Mutate 1 document in Bronze, rebuild Silver + Gold, and confirm strictly its chunks re-embed.
     bronze_docs_path = settings.bronze_dir / "raw_documents.parquet"
-    bronze_df = pd.read_parquet(bronze_docs_path)
-    mask = bronze_df["doc_id"] == "NCD190.15"
-    bronze_df.loc[mask, "raw_html"] = (
-        str(bronze_df.loc[mask, "raw_html"].iloc[0])
-        + "<p>Updated hematology documentation requirement for delta test.</p>"
-    )
-    bronze_df.to_parquet(bronze_docs_path, index=False)
+    bronze_table = pq.read_table(bronze_docs_path)
+    bronze_rows = bronze_table.to_pylist()
+    for row in bronze_rows:
+        if row["doc_id"] == "NCD190.15":
+            row["raw_html"] = (
+                str(row["raw_html"])
+                + "<p>Updated hematology documentation requirement for delta test.</p>"
+            )
+    pq.write_table(pa.Table.from_pylist(bronze_rows, schema=bronze_table.schema), bronze_docs_path)
 
     silver_after = build_silver(settings)
     third = build_gold(
@@ -155,10 +160,11 @@ def test_gold_idempotency_and_delta_reembed(tmp_path: Path) -> None:
         quarantined_docs=silver_after.quarantined_docs,
         embed_fn=_deterministic_embed,
     )
-    chunks_df = pd.read_parquet(third.chunks_path)
-    assert "is_active" not in chunks_df.columns
-    assert "hcpcs_codes" in chunks_df.columns
-    ncd_chunks = int((chunks_df["doc_id"] == "NCD190.15").sum())
+    chunks_table = pq.read_table(third.chunks_path)
+    assert "is_active" not in chunks_table.column_names
+    assert "hcpcs_codes" in chunks_table.column_names
+    assert "valid_to" in chunks_table.column_names
+    ncd_chunks = sum(1 for row in chunks_table.to_pylist() if row["doc_id"] == "NCD190.15")
 
     assert third.manifest.chunks_embedded > 0
     assert third.manifest.chunks_embedded <= ncd_chunks
@@ -167,8 +173,8 @@ def test_gold_idempotency_and_delta_reembed(tmp_path: Path) -> None:
     )
 
 
-def test_gold_index_duckdb_opens_readonly_with_fts_and_vectors(tmp_path: Path) -> None:
-    """Verify pre-built index.duckdb opens read-only with active FTS BM25 and cosine distance."""
+def test_gold_index_duckdb_opens_readonly_with_fts_vectors_and_scd2_views(tmp_path: Path) -> None:
+    """Verify pre-built index.duckdb opens read-only with FTS, vectors, and SCD2 chunks_as_of."""
     settings = Settings(data_dir=tmp_path)
     ingest_sample_fixtures(settings)
     silver_res = build_silver(settings)
@@ -199,6 +205,12 @@ def test_gold_index_duckdb_opens_readonly_with_fts_and_vectors(tmp_path: Path) -
             "FROM chunks ORDER BY dist ASC LIMIT 5",
             [query_vec],
         ).fetchall()
+        docs_2021 = {
+            (row[0], row[1])
+            for row in con.execute(
+                "SELECT DISTINCT doc_id, version FROM chunks_as_of(DATE '2021-06-01')"
+            ).fetchall()
+        }
         docs_2023 = {
             row[0]
             for row in con.execute(
@@ -206,9 +218,9 @@ def test_gold_index_duckdb_opens_readonly_with_fts_and_vectors(tmp_path: Path) -
             ).fetchall()
         }
         docs_2026 = {
-            row[0]
+            (row[0], row[1])
             for row in con.execute(
-                "SELECT DISTINCT doc_id FROM chunks_as_of(DATE '2026-01-01')"
+                "SELECT DISTINCT doc_id, version FROM chunks_as_of(DATE '2026-01-01')"
             ).fetchall()
         }
         active_view_docs = {
@@ -218,6 +230,10 @@ def test_gold_index_duckdb_opens_readonly_with_fts_and_vectors(tmp_path: Path) -
     assert len(fts_hits) > 0
     assert any(doc_id in {"L33822", "A56542"} for _, doc_id, _ in fts_hits)
     assert len(vec_hits) == 5
+    assert ("L33822", 11) in docs_2021
+    assert ("L33822", 12) not in docs_2021
     assert "L33381" in docs_2023
-    assert "L33381" not in docs_2026
+    assert ("L33822", 12) in docs_2026
+    assert ("L33822", 11) not in docs_2026
+    assert all(doc_id != "L33381" for doc_id, _ in docs_2026)
     assert "L33381" not in active_view_docs

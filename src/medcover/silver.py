@@ -19,15 +19,14 @@ from medcover.config import Settings
 from medcover.contracts import (
     BRONZE_CROSSWALKS_ARROW_SCHEMA,
     SILVER_POLICIES_ARROW_SCHEMA,
-    SILVER_POLICIES_SCHEMA,
     SILVER_QUARANTINE_ARROW_SCHEMA,
-    SILVER_QUARANTINE_SCHEMA,
     VALID_DOC_TYPES,
     VALID_SOURCE_MODES,
     VALID_STATUSES,
     parse_optional_date,
     parse_optional_int,
     parse_optional_str,
+    validate_arrow_table,
 )
 from medcover.sql import load_sql
 
@@ -126,11 +125,15 @@ def build_silver(settings: Settings) -> SilverResult:
         quarantined_rows,
         schema=SILVER_QUARANTINE_ARROW_SCHEMA,
     )
-    SILVER_QUARANTINE_SCHEMA.validate(quarantine_table.to_pandas())
+    validate_arrow_table(quarantine_table, SILVER_QUARANTINE_ARROW_SCHEMA)
     pq.write_table(quarantine_table, quarantine_path)
 
     policies_table = _aggregate_silver_policies(valid_rows, codes_table)
-    SILVER_POLICIES_SCHEMA.validate(policies_table.to_pandas())
+    validate_arrow_table(
+        policies_table,
+        SILVER_POLICIES_ARROW_SCHEMA,
+        unique_keys=("doc_id", "version"),
+    )
     pq.write_table(policies_table, policies_path)
 
     return SilverResult(

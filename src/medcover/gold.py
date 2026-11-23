@@ -23,9 +23,10 @@ from medcover.contracts import (
     VALID_SOURCE_MODES,
     RunManifest,
     SourceMode,
-    build_gold_chunks_schema,
     gold_chunks_arrow_schema,
+    validate_arrow_table,
 )
+from medcover.sql import load_sql
 
 EmbedFn = Callable[[Sequence[str]], list[list[float]]]
 
@@ -156,14 +157,17 @@ def build_gold(
         enriched_rows,
         schema=gold_chunks_arrow_schema(settings.embedding_dim),
     )
-    chunks_df = chunks_table.to_pandas()
-    build_gold_chunks_schema(settings.embedding_dim).validate(chunks_df)
+    validate_arrow_table(
+        chunks_table,
+        gold_chunks_arrow_schema(settings.embedding_dim),
+        unique_keys=("doc_id", "version", "chunk_index"),
+    )
     pq.write_table(chunks_table, chunks_path)
 
     _build_duckdb_index(
-        chunks_path=chunks_path,
+        chunks_table=chunks_table,
         index_path=index_path,
-        embedding_dim=settings.embedding_dim,
+        storage_version=settings.duckdb_storage_version,
         extension_dir=settings.resolved_duckdb_extension_dir(),
     )
 
@@ -183,12 +187,9 @@ def build_gold(
         )
     )
 
-    if chunks_df.empty:
-        token_p50, token_p95 = 0.0, 0.0
-    else:
-        quantiles = chunks_df["token_count"].quantile([0.50, 0.95])
-        token_p50 = float(quantiles.loc[0.50])
-        token_p95 = float(quantiles.loc[0.95])
+    token_counts = sorted(int(val) for val in chunks_table.column("token_count").to_pylist())
+    token_p50 = _linear_quantile(token_counts, 0.50)
+    token_p95 = _linear_quantile(token_counts, 0.95)
 
     now = datetime.now(tz=UTC)
     git_sha = _resolve_git_sha()
@@ -202,6 +203,8 @@ def build_gold(
         git_sha=git_sha,
         timestamp_utc=now,
         source_modes=resolved_source_modes,
+        duckdb_version=duckdb.__version__,
+        duckdb_storage_version=settings.duckdb_storage_version,
         bronze_docs=bronze_count,
         silver_docs=silver_count,
         quarantined_docs=quarantine_count,
@@ -500,6 +503,7 @@ def _build_candidate_chunks(
                     "mac_jurisdiction": record["mac_jurisdiction"],
                     "effective_date": record["effective_date"],
                     "retired_date": record["retired_date"],
+                    "valid_to": record["valid_to"],
                     "embedding_model": settings.embedding_model,
                 }
             )
@@ -586,9 +590,9 @@ def _apply_incremental_embeddings(
 
 def _build_duckdb_index(
     *,
-    chunks_path: Path,
+    chunks_table: pa.Table,
     index_path: Path,
-    embedding_dim: int,
+    storage_version: str,
     extension_dir: Path | None,
 ) -> None:
     tmp_path = index_path.with_suffix(".duckdb.tmp")
@@ -596,10 +600,13 @@ def _build_duckdb_index(
         if stale.exists():
             stale.unlink()
 
-    config: dict[str, str | bool | int | float | list[str]] = {}
+    config: dict[str, str | bool | int | float | list[str]] = {
+        "storage_compatibility_version": storage_version,
+    }
     if extension_dir is not None:
         config["extension_directory"] = str(extension_dir.resolve())
 
+    build_sql = load_sql("build_index.sql")
     with duckdb.connect(str(tmp_path), config=config) as con:
         try:
             con.execute("LOAD fts")
@@ -607,28 +614,27 @@ def _build_duckdb_index(
             con.execute("INSTALL fts")
             con.execute("LOAD fts")
 
-        con.execute(
-            f"CREATE TABLE chunks AS "
-            f"SELECT * REPLACE (CAST(embedding AS FLOAT[{embedding_dim}]) AS embedding) "
-            f"FROM read_parquet(?)",
-            [str(chunks_path)],
-        )
+        con.register("gold_chunks_input", chunks_table)
+        con.execute(build_sql)
         con.execute(
             "PRAGMA create_fts_index("
             "'chunks', 'chunk_id', 'title', 'section_heading', 'chunk_text', "
             "stemmer='porter', stopwords='english', overwrite=1)"
         )
-        con.execute(
-            "CREATE OR REPLACE MACRO chunks_as_of(as_of_date) AS TABLE "
-            "SELECT * FROM chunks "
-            "WHERE effective_date <= as_of_date "
-            "AND (retired_date IS NULL OR retired_date > as_of_date)"
-        )
-        con.execute(
-            "CREATE OR REPLACE VIEW active_chunks AS SELECT * FROM chunks_as_of(CURRENT_DATE)"
-        )
 
     os.replace(tmp_path, index_path)
+
+
+def _linear_quantile(sorted_values: Sequence[int], q: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    pos = (len(sorted_values) - 1) * q
+    low = int(pos)
+    high = min(low + 1, len(sorted_values) - 1)
+    weight = pos - low
+    return float(sorted_values[low] * (1.0 - weight) + sorted_values[high] * weight)
 
 
 def _parquet_row_count(path: Path, *, fallback: int) -> int:

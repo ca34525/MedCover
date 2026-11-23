@@ -6,7 +6,8 @@ import re
 from collections.abc import Callable, Sequence
 from datetime import date
 from pathlib import Path
-from typing import Any, Literal
+from types import TracebackType
+from typing import Any, Literal, Self
 
 import duckdb
 import httpx
@@ -27,8 +28,14 @@ _DEFAULT_MODELS: dict[LLMProvider, str] = {
     "gemini": "gemini-2.5-flash",
 }
 
+_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _BRACKET_GROUP_RE = re.compile(r"\[([^\[\]\n]{1,80})\](?!\()")
 _POLICY_ID_RE = re.compile(r"^[A-Za-z]+[0-9][A-Za-z0-9._-]*$")
+
+_INFORMATIONAL_DISCLAIMER = (
+    "Informational summary of retrieved CMS coverage policies only; "
+    "citations_verified checks citation provenance, not clinical or legal accuracy."
+)
 
 _SYSTEM_PROMPT = (
     "You are a Medicare coverage policy assistant. Answer strictly from the provided "
@@ -37,6 +44,20 @@ _SYSTEM_PROMPT = (
     "[A56542], or [NCD220.6]). Do not cite any policy ID that is not present in the "
     "excerpts. If the excerpts do not answer the question, state that clearly."
 )
+
+
+def validate_model_name(model: str) -> str:
+    """Validate an LLM model identifier against the strict URL-safe character policy.
+
+    Inputs: non-empty model identifier string.
+    Output grain: single stripped, validated model string.
+    Invariants: rejects path traversal, query strings, whitespace, and strings >64 chars.
+    """
+    cleaned = model.strip()
+    if not _MODEL_NAME_RE.match(cleaned):
+        msg = "model must match ^[A-Za-z0-9._-]{1,64}$"
+        raise ValueError(msg)
+    return cleaned
 
 
 class RetrieveRequest(BaseModel):
@@ -94,6 +115,7 @@ class RetrievedChunk(BaseModel):
     mac_jurisdiction: str | None
     effective_date: date
     retired_date: date | None
+    valid_to: date | None = None
     bm25_score: float | None = None
     bm25_rank: int | None = None
     cosine_distance: float | None = None
@@ -115,9 +137,15 @@ class AskRequest(RetrieveRequest):
     provider: LLMProvider = Field(default="openai")
     model: str | None = Field(default=None)
 
+    @field_validator("model", mode="before")
+    @classmethod
+    def _validate_optional_model(cls, value: Any) -> str | None:
+        cleaned = parse_optional_str(value)
+        return validate_model_name(cleaned) if cleaned is not None else None
+
 
 class AskResponse(BaseModel):
-    """Grounded RAG answer with deterministic citation verification metadata."""
+    """RAG answer with deterministic citation-provenance verification metadata."""
 
     query: str
     provider: LLMProvider
@@ -125,12 +153,13 @@ class AskResponse(BaseModel):
     answer: str
     cited_doc_ids: list[str]
     ungrounded_doc_ids: list[str]
-    grounding_verified: bool
+    citations_verified: bool
+    disclaimer: str = Field(default=_INFORMATIONAL_DISCLAIMER)
     chunks: list[RetrievedChunk]
 
 
 class HybridRetriever:
-    """Read-only DuckDB hybrid BM25 + vector RRF retriever over Gold ``index.duckdb``."""
+    """Shared read-only DuckDB hybrid BM25 + vector RRF retriever over Gold ``index.duckdb``."""
 
     def __init__(
         self,
@@ -139,11 +168,13 @@ class HybridRetriever:
         settings: Settings | None = None,
         embed_fn: EmbedFn | None = None,
     ) -> None:
-        """Initialize a read-only retriever bound to a pre-built Gold ``index.duckdb``.
+        """Initialize a shared read-only retriever bound to a pre-built Gold ``index.duckdb``.
 
         Inputs: path to pre-indexed ``index.duckdb``, optional ``Settings``, optional ``embed_fn``.
-        Output grain: reusable retriever instance caching only the ONNX embedding model in memory.
-        Invariants: never mutates ``index.duckdb`` and never rebuilds FTS indexes at query time.
+        Output grain: reusable retriever holding one read-only DuckDB connection (using per-query
+        ``.cursor()`` handles) and lazy-cached ONNX embedder.
+        Invariants: never mutates ``index.duckdb``, caps DuckDB ``memory_limit`` and ``threads``,
+        and loads pre-baked ``fts`` once at initialization.
         """
         if not index_path.exists():
             msg = f"Gold DuckDB index not found: {index_path}"
@@ -154,13 +185,66 @@ class HybridRetriever:
         self._model: TextEmbedding | None = None
         self._sql = load_sql("hybrid_search.sql")
 
+        config: dict[str, str | bool | int | float | list[str]] = {
+            "memory_limit": self._settings.duckdb_memory_limit,
+            "threads": self._settings.duckdb_threads,
+        }
+        ext_dir = self._settings.resolved_duckdb_extension_dir()
+        if ext_dir is not None:
+            config["extension_directory"] = str(ext_dir.resolve())
+
+        self._con: duckdb.DuckDBPyConnection | None = duckdb.connect(
+            str(self._index_path),
+            read_only=True,
+            config=config,
+        )
+        try:
+            self._con.execute("LOAD fts")
+        except Exception:
+            self.close()
+            raise
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close the shared read-only DuckDB connection idempotently.
+
+        Inputs: none.
+        Output grain: ``None``.
+        Invariants: safe to call multiple times (e.g., FastAPI lifespan shutdown).
+        """
+        if self._con is not None:
+            self._con.close()
+            self._con = None
+
+    def cursor(self) -> duckdb.DuckDBPyConnection:
+        """Create a lightweight read-only DuckDB cursor from the shared connection.
+
+        Inputs: none.
+        Output grain: single ``DuckDBPyConnection`` cursor for per-request queries.
+        Invariants: raises ``RuntimeError`` if the retriever has been closed.
+        """
+        if self._con is None:
+            msg = "HybridRetriever connection is closed"
+            raise RuntimeError(msg)
+        return self._con.cursor()
+
     def search(self, request: RetrieveRequest) -> RetrieveResponse:
-        """Run metadata-filtered BM25 + cosine RRF retrieval against read-only ``index.duckdb``.
+        """Run metadata-filtered BM25 + cosine RRF retrieval against shared read-only DuckDB.
 
         Inputs: validated ``RetrieveRequest`` containing query text, ``top_k``, and filters.
         Output grain: ``RetrieveResponse`` with up to ``top_k`` ranked ``RetrievedChunk`` rows.
-        Invariants: opens DuckDB with ``read_only=True``; enforces
-        ``[effective_date, retired_date)`` containment whenever ``as_of_date`` is provided.
+        Invariants: uses a per-call ``.cursor()``; enforces SCD2 ``[effective_date, valid_to)``
+        containment whenever ``as_of_date`` is provided.
         """
         query_embedding = self._embed_query(request.query)
         candidate_limit = max(request.top_k * 4, 25)
@@ -172,15 +256,12 @@ class HybridRetriever:
             candidate_limit=candidate_limit,
         )
 
-        config: dict[str, str | bool | int | float | list[str]] = {}
-        ext_dir = self._settings.resolved_duckdb_extension_dir()
-        if ext_dir is not None:
-            config["extension_directory"] = str(ext_dir.resolve())
-
-        with duckdb.connect(str(self._index_path), read_only=True, config=config) as con:
-            con.execute("LOAD fts")
-            con.register("search_params", params_table)
-            rows = con.sql(self._sql).to_arrow_table().to_pylist()
+        cur = self.cursor()
+        try:
+            cur.register("search_params", params_table)
+            rows = cur.sql(self._sql).to_arrow_table().to_pylist()
+        finally:
+            cur.close()
 
         chunks = [_row_to_chunk(row) for row in rows]
         return RetrieveResponse(
@@ -218,14 +299,16 @@ def retrieve_chunks(
 
     Inputs: ``RetrieveRequest`` plus optional ``Settings``, explicit ``index_path``, and embedder.
     Output grain: ``RetrieveResponse`` ordered by descending RRF score.
-    Invariants: opens ``index.duckdb`` strictly read-only.
+    Invariants: opens ``index.duckdb`` strictly read-only and closes the connection on return.
     """
     resolved_settings = settings if settings is not None else get_settings()
     resolved_index = (
         index_path if index_path is not None else resolved_settings.gold_dir / "index.duckdb"
     )
-    retriever = HybridRetriever(resolved_index, settings=resolved_settings, embed_fn=embed_fn)
-    return retriever.search(request)
+    with HybridRetriever(
+        resolved_index, settings=resolved_settings, embed_fn=embed_fn
+    ) as retriever:
+        return retriever.search(request)
 
 
 def verify_citations(
@@ -235,9 +318,10 @@ def verify_citations(
     """Verify every bracketed policy citation in an LLM answer against retrieved ``doc_id`` values.
 
     Inputs: generated answer string and sequence of retrieved chunks provided as context.
-    Output grain: ``(cited_doc_ids, ungrounded_doc_ids, grounding_verified)`` tuple.
-    Invariants: deduplicates cited IDs in appearance order; requires zero ungrounded IDs and
-    at least one grounded citation whenever ``retrieved_chunks`` is non-empty.
+    Output grain: ``(cited_doc_ids, ungrounded_doc_ids, citations_verified)`` tuple.
+    Invariants: verifies citation provenance only (not clinical accuracy); deduplicates cited IDs
+    in appearance order; requires zero ungrounded IDs and at least one retrieved citation whenever
+    ``retrieved_chunks`` is non-empty.
     """
     allowed = {chunk.doc_id.upper(): chunk.doc_id for chunk in retrieved_chunks}
     cited: list[str] = []
@@ -271,19 +355,23 @@ def synthesize_answer(
     http_client: httpx.Client | None = None,
     timeout_seconds: float = 30.0,
 ) -> AskResponse:
-    """Synthesize a grounded Medicare coverage answer via stateless BYO-key ``httpx`` request.
+    """Synthesize a cited Medicare coverage summary via stateless BYO-key ``httpx`` request.
 
     Inputs: question, retrieved chunks, LLM provider, in-memory BYO API key, and optional model.
-    Output grain: ``AskResponse`` with deterministic ``grounding_verified`` citation status.
-    Invariants: ``api_key`` stays strictly in memory on the outbound request headers and is never
-    logged, cached, persisted, or echoed in exceptions or responses.
+    Output grain: ``AskResponse`` with deterministic ``citations_verified`` provenance status.
+    Invariants: validates ``model`` against ``^[A-Za-z0-9._-]{1,64}$`` before URL construction;
+    ``api_key`` stays strictly in memory on outbound request headers and is never logged, cached,
+    persisted, or echoed in exceptions or responses.
     """
     cleaned_key = api_key.strip()
     if not cleaned_key:
         msg = "X-LLM-API-Key header must be non-empty"
         raise ValueError(msg)
 
-    resolved_model = parse_optional_str(model) or _DEFAULT_MODELS[provider]
+    raw_model = parse_optional_str(model)
+    resolved_model = (
+        validate_model_name(raw_model) if raw_model is not None else _DEFAULT_MODELS[provider]
+    )
     user_prompt = _build_user_prompt(query, chunks)
     url, headers, payload = _build_provider_request(
         provider=provider,
@@ -315,7 +403,7 @@ def synthesize_answer(
         answer=answer,
         cited_doc_ids=cited,
         ungrounded_doc_ids=ungrounded,
-        grounding_verified=verified,
+        citations_verified=verified,
         chunks=list(chunks),
     )
 
@@ -377,6 +465,7 @@ def _row_to_chunk(row: dict[str, Any]) -> RetrievedChunk:
         mac_jurisdiction=parse_optional_str(row["mac_jurisdiction"]),
         effective_date=row["effective_date"],
         retired_date=row["retired_date"],
+        valid_to=row["valid_to"],
         bm25_score=float(row["bm25_score"]) if row["bm25_score"] is not None else None,
         bm25_rank=int(row["bm25_rank"]) if row["bm25_rank"] is not None else None,
         cosine_distance=(
@@ -394,10 +483,11 @@ def _build_user_prompt(query: str, chunks: Sequence[RetrievedChunk]) -> str:
     blocks: list[str] = []
     for chunk in chunks:
         codes = ", ".join(chunk.hcpcs_codes[:10]) if chunk.hcpcs_codes else "none"
-        retired = chunk.retired_date.isoformat() if chunk.retired_date is not None else "none"
+        valid_to = chunk.valid_to.isoformat() if chunk.valid_to is not None else "open"
         blocks.append(
             f"[{chunk.doc_id}] ({chunk.doc_type} v{chunk.version}, "
-            f"Effective: {chunk.effective_date.isoformat()}, Retired: {retired}, HCPCS: {codes})\n"
+            f"Effective: {chunk.effective_date.isoformat()}, "
+            f"Valid To: {valid_to}, HCPCS: {codes})\n"
             f"Title: {chunk.title}\n"
             f"Section: {chunk.section_heading}\n"
             f"{chunk.chunk_text}"

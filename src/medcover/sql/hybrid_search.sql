@@ -14,6 +14,7 @@ WITH filtered AS (
         c.mac_jurisdiction,
         c.effective_date,
         c.retired_date,
+        c.valid_to,
         c.embedding
     FROM chunks AS c
     CROSS JOIN search_params AS p
@@ -22,7 +23,7 @@ WITH filtered AS (
             p.as_of_date IS NULL
             OR (
                 c.effective_date <= p.as_of_date
-                AND (c.retired_date IS NULL OR c.retired_date > p.as_of_date)
+                AND (c.valid_to IS NULL OR c.valid_to > p.as_of_date)
             )
         )
         AND (p.hcpcs_code IS NULL OR LIST_CONTAINS(c.hcpcs_codes, UPPER(p.hcpcs_code)))
@@ -118,6 +119,7 @@ final_ranked AS (
         c.mac_jurisdiction,
         c.effective_date,
         c.retired_date,
+        c.valid_to,
         f.bm25_score,
         f.bm25_rank,
         f.cosine_distance,
@@ -144,6 +146,7 @@ SELECT
     r.mac_jurisdiction,
     r.effective_date,
     r.retired_date,
+    r.valid_to,
     r.bm25_score,
     r.bm25_rank,
     r.cosine_distance,

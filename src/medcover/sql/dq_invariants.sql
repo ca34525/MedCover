@@ -12,6 +12,17 @@ WITH silver_duplicate_grain AS (
     ) AS dupes
 ),
 
+silver_overlapping_versions AS (
+    SELECT COUNT(*) AS violation_count
+    FROM silver_policies AS a
+    INNER JOIN silver_policies AS b
+        ON
+            a.doc_id = b.doc_id
+            AND a.version < b.version
+            AND (a.valid_to IS NULL OR a.valid_to > b.effective_date)
+            AND (b.valid_to IS NULL OR a.effective_date < b.valid_to)
+),
+
 gold_duplicate_grain AS (
     SELECT COUNT(*) AS violation_count
     FROM (
@@ -76,6 +87,17 @@ FROM silver_duplicate_grain
 UNION ALL
 
 SELECT
+    'silver_valid_doc_types' AS check_name,
+    COUNT(*) AS violation_count,
+    'Invalid doc_type or version < 1 in silver/policies.parquet' AS detail
+FROM silver_policies
+WHERE
+    doc_type NOT IN ('NCD', 'LCD', 'ARTICLE')
+    OR version < 1
+
+UNION ALL
+
+SELECT
     'silver_non_empty_markdown' AS check_name,
     COUNT(*) AS violation_count,
     'Empty markdown_text rows in silver/policies.parquet' AS detail
@@ -87,11 +109,19 @@ UNION ALL
 SELECT
     'silver_valid_dates' AS check_name,
     COUNT(*) AS violation_count,
-    'Rows with retired_date < effective_date in silver/policies.parquet' AS detail
+    'Rows with retired_date or valid_to before effective_date in silver/policies.parquet' AS detail
 FROM silver_policies
 WHERE
-    retired_date IS NOT NULL
-    AND retired_date < effective_date
+    (retired_date IS NOT NULL AND retired_date < effective_date)
+    OR (valid_to IS NOT NULL AND valid_to < effective_date)
+
+UNION ALL
+
+SELECT
+    'silver_no_overlapping_versions' AS check_name,
+    violation_count,
+    'Overlapping [effective_date, valid_to) intervals across versions of the same doc_id' AS detail
+FROM silver_overlapping_versions
 
 UNION ALL
 
@@ -117,6 +147,18 @@ SELECT
     violation_count,
     'Duplicate chunk_id values in gold/chunks.parquet' AS detail
 FROM gold_duplicate_chunk_id
+
+UNION ALL
+
+SELECT
+    'gold_valid_doc_types' AS check_name,
+    COUNT(*) AS violation_count,
+    'Invalid doc_type, version < 1, or chunk_index < 0 in gold/chunks.parquet' AS detail
+FROM gold_chunks
+WHERE
+    doc_type NOT IN ('NCD', 'LCD', 'ARTICLE')
+    OR version < 1
+    OR chunk_index < 0
 
 UNION ALL
 
@@ -164,11 +206,11 @@ UNION ALL
 SELECT
     'gold_valid_dates' AS check_name,
     COUNT(*) AS violation_count,
-    'Rows with retired_date < effective_date in gold/chunks.parquet' AS detail
+    'Rows with retired_date or valid_to before effective_date in gold/chunks.parquet' AS detail
 FROM gold_chunks
 WHERE
-    retired_date IS NOT NULL
-    AND retired_date < effective_date
+    (retired_date IS NOT NULL AND retired_date < effective_date)
+    OR (valid_to IS NOT NULL AND valid_to < effective_date)
 
 UNION ALL
 

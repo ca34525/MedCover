@@ -7,7 +7,7 @@ import zipfile
 from datetime import date
 from pathlib import Path
 
-import pandas as pd
+import pyarrow.parquet as pq
 import pytest
 
 from medcover.bronze import ingest_sample_fixtures, ingest_zip_or_dir
@@ -19,14 +19,19 @@ def test_ingest_sample_fixtures_grain_and_counts(tmp_path: Path) -> None:
     settings = Settings(data_dir=tmp_path)
     result = ingest_sample_fixtures(settings)
 
-    docs_df = pd.read_parquet(result.documents_path)
-    codes_df = pd.read_parquet(result.crosswalks_path)
+    docs = pq.read_table(result.documents_path).to_pylist()
+    codes = pq.read_table(result.crosswalks_path).to_pylist()
 
-    assert result.total_documents == 15
-    assert len(docs_df) == 15
-    assert not docs_df.duplicated(subset=["doc_id", "version"]).any()
-    assert set(docs_df["doc_type"].dropna()) == {"NCD", "LCD", "ARTICLE"}
-    assert len(codes_df) > 0
+    assert result.total_documents == 16
+    assert len(docs) == 16
+    keys = [(row["doc_id"], row["version"]) for row in docs]
+    assert len(keys) == len(set(keys))
+    assert {row["doc_type"] for row in docs if row["doc_type"] is not None} == {
+        "NCD",
+        "LCD",
+        "ARTICLE",
+    }
+    assert len(codes) > 0
 
 
 def test_nested_csv_zip_multiline_and_windows1252(tmp_path: Path) -> None:
@@ -46,10 +51,10 @@ def test_nested_csv_zip_multiline_and_windows1252(tmp_path: Path) -> None:
 
     bronze_dir = tmp_path / "bronze"
     result = ingest_zip_or_dir(outer_path, bronze_dir)
-    docs_df = pd.read_parquet(result.documents_path)
+    docs = pq.read_table(result.documents_path).to_pylist()
 
     assert result.total_documents == 1
-    row = docs_df.iloc[0]
+    row = docs[0]
     assert row["doc_id"] == "L77777"
     assert "\u00a71" in str(row["raw_html"])
     assert "Line one\nLine two" in str(row["raw_html"])
@@ -73,10 +78,10 @@ def test_bronze_upsert_preserves_historical_versions(tmp_path: Path) -> None:
     bronze_dir = tmp_path / "bronze"
     ingest_zip_or_dir(v1_csv, bronze_dir)
     ingest_zip_or_dir(v2_csv, bronze_dir)
-    docs_df = pd.read_parquet(bronze_dir / "raw_documents.parquet")
+    docs = pq.read_table(bronze_dir / "raw_documents.parquet").to_pylist()
 
-    assert len(docs_df) == 2
-    assert list(docs_df["version"]) == [1, 2]
+    assert len(docs) == 2
+    assert [row["version"] for row in docs] == [1, 2]
 
 
 def test_bronze_reingest_replaces_obsolete_crosswalks(tmp_path: Path) -> None:
@@ -92,14 +97,16 @@ def test_bronze_reingest_replaces_obsolete_crosswalks(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     ingest_zip_or_dir(updated_codes, settings.bronze_dir)
-    codes_df = pd.read_parquet(settings.bronze_dir / "raw_code_crosswalks.parquet")
-    l33822_codes = codes_df[(codes_df["doc_id"] == "L33822") & (codes_df["version"] == 12)]
-    assert list(l33822_codes["code_system"]) == ["HCPCS"]
-    assert list(l33822_codes["code"]) == ["72148"]
+    codes = pq.read_table(settings.bronze_dir / "raw_code_crosswalks.parquet").to_pylist()
+    l33822_codes = [row for row in codes if row["doc_id"] == "L33822" and row["version"] == 12]
+    assert [row["code_system"] for row in l33822_codes] == ["HCPCS"]
+    assert [row["code"] for row in l33822_codes] == ["72148"]
 
 
-def test_cms_bulk_lcd_columns_dates_and_unrecognized_archive(tmp_path: Path) -> None:
-    """Verify CMS MCD bulk headers and US dates ingest cleanly and empty/unknown CSVs fail."""
+def test_cms_bulk_lcd_columns_dates_noncovered_exclusion_and_unknown_archive(
+    tmp_path: Path,
+) -> None:
+    """Verify CMS bulk tables parse dates, skip noncovered ICD-10 files, and reject unknown CSVs."""
     cms_dir = tmp_path / "cms_bulk"
     cms_dir.mkdir()
     (cms_dir / "lcd.csv").write_text(
@@ -112,24 +119,32 @@ def test_cms_bulk_lcd_columns_dates_and_unrecognized_archive(tmp_path: Path) -> 
         "lcd_id,lcd_version,hcpc_code_id\n35391,3,72148\n35391,3,E0601\n35391,3,0042T\n",
         encoding="utf-8",
     )
+    (cms_dir / "article_x_icd10_covered.csv").write_text(
+        "article_id,article_version,icd10_code_id\n56542,1,M51.16\n",
+        encoding="utf-8",
+    )
+    (cms_dir / "article_x_icd10_noncovered.csv").write_text(
+        "article_id,article_version,icd10_code_id\n56542,1,Z00.00\n",
+        encoding="utf-8",
+    )
 
     result = ingest_zip_or_dir(cms_dir, tmp_path / "bronze")
-    docs_df = pd.read_parquet(result.documents_path)
-    codes_df = pd.read_parquet(result.crosswalks_path)
+    docs = {row["doc_id"]: row for row in pq.read_table(result.documents_path).to_pylist()}
+    codes = pq.read_table(result.crosswalks_path).to_pylist()
 
     assert result.total_documents == 2
-    assert set(docs_df["doc_id"]) == {"L35391", "L35392"}
-    l35391 = docs_df[docs_df["doc_id"] == "L35391"].iloc[0]
+    assert set(docs) == {"L35391", "L35392"}
+    l35391 = docs["L35391"]
     assert l35391["doc_type"] == "LCD"
     assert l35391["effective_date"] == date(2024, 4, 1)
-    assert pd.isna(l35391["retired_date"])
+    assert l35391["retired_date"] is None
     assert l35391["status"] == "ACTIVE"
-    l35392 = docs_df[docs_df["doc_id"] == "L35392"].iloc[0]
-    assert pd.isna(l35392["effective_date"])
-    assert set(zip(codes_df["code_system"], codes_df["code"], strict=True)) == {
-        ("HCPCS", "72148"),
-        ("HCPCS", "E0601"),
-        ("HCPCS", "0042T"),
+    assert docs["L35392"]["effective_date"] is None
+    assert {(row["doc_id"], row["code_system"], row["code"]) for row in codes} == {
+        ("L35391", "HCPCS", "72148"),
+        ("L35391", "HCPCS", "E0601"),
+        ("L35391", "HCPCS", "0042T"),
+        ("A56542", "ICD10", "M51.16"),
     }
 
     unknown_csv = tmp_path / "unknown.csv"
@@ -163,17 +178,20 @@ def test_bronze_partial_bundle_preserves_other_family_crosswalks_and_rejects_gar
     )
 
     ingest_zip_or_dir(partial_dir, settings.bronze_dir)
-    docs_df = pd.read_parquet(settings.bronze_dir / "raw_documents.parquet")
-    codes_df = pd.read_parquet(settings.bronze_dir / "raw_code_crosswalks.parquet")
+    docs = {
+        (row["doc_id"], row["version"]): row
+        for row in pq.read_table(settings.bronze_dir / "raw_documents.parquet").to_pylist()
+    }
+    codes = pq.read_table(settings.bronze_dir / "raw_code_crosswalks.parquet").to_pylist()
 
-    l35399 = docs_df[docs_df["doc_id"] == "L35399"].iloc[0]
-    assert pd.isna(l35399["effective_date"])
+    assert docs[("L35399", 1)]["effective_date"] is None
+    assert docs[("NCD220.6", 2)]["status"] is None
 
-    # CMS native NCD rows without a status column keep status as None (never fabricated).
-    ncd220 = docs_df[docs_df["doc_id"] == "NCD220.6"].iloc[0]
-    assert pd.isna(ncd220["status"])
-
-    ncd_codes = codes_df[(codes_df["doc_id"] == "NCD220.6") & (codes_df["version"] == 2)]
-    assert set(ncd_codes["code"]) >= {"78815", "78816", "C34.90"}
-    l35399_codes = codes_df[(codes_df["doc_id"] == "L35399") & (codes_df["version"] == 1)]
-    assert list(l35399_codes["code"]) == ["72148"]
+    ncd_codes = {
+        row["code"] for row in codes if row["doc_id"] == "NCD220.6" and row["version"] == 2
+    }
+    assert ncd_codes >= {"78815", "78816", "C34.90"}
+    l35399_codes = [
+        row["code"] for row in codes if row["doc_id"] == "L35399" and row["version"] == 1
+    ]
+    assert l35399_codes == ["72148"]

@@ -101,7 +101,6 @@ def evaluate_retrieval(
         index_path if index_path is not None else settings.gold_dir / "index.duckdb"
     )
     queries = load_eval_queries(resolved_queries_path)
-    retriever = HybridRetriever(resolved_index_path, settings=settings, embed_fn=embed_fn)
 
     results: list[EvalQueryResult] = []
     recall_scores: list[float] = []
@@ -109,59 +108,66 @@ def evaluate_retrieval(
     total_temporal_violations = 0
     total_forbidden_violations = 0
 
-    for item in queries:
-        response = retriever.search(
-            RetrieveRequest(
-                query=item.query,
-                top_k=item.top_k,
-                as_of_date=item.as_of_date,
-                hcpcs_code=item.hcpcs_code,
-                icd10_code=item.icd10_code,
-                doc_type=item.doc_type,
-                mac_jurisdiction=item.mac_jurisdiction,
+    with HybridRetriever(resolved_index_path, settings=settings, embed_fn=embed_fn) as retriever:
+        for item in queries:
+            response = retriever.search(
+                RetrieveRequest(
+                    query=item.query,
+                    top_k=item.top_k,
+                    as_of_date=item.as_of_date,
+                    hcpcs_code=item.hcpcs_code,
+                    icd10_code=item.icd10_code,
+                    doc_type=item.doc_type,
+                    mac_jurisdiction=item.mac_jurisdiction,
+                )
             )
-        )
-        ranked_doc_ids = _dedupe_doc_ids(chunk.doc_id for chunk in response.chunks)
+            ranked_doc_ids = _dedupe_doc_ids(chunk.doc_id for chunk in response.chunks)
 
-        temporal_violations = 0
-        if item.as_of_date is not None:
-            temporal_violations = sum(
-                1
-                for chunk in response.chunks
-                if chunk.effective_date > item.as_of_date
-                or (chunk.retired_date is not None and chunk.retired_date <= item.as_of_date)
+            temporal_violations = 0
+            if item.as_of_date is not None:
+                temporal_violations = sum(
+                    1
+                    for chunk in response.chunks
+                    if chunk.effective_date > item.as_of_date
+                    or (chunk.valid_to is not None and chunk.valid_to <= item.as_of_date)
+                )
+                versions_by_doc: dict[str, set[int]] = {}
+                for chunk in response.chunks:
+                    versions_by_doc.setdefault(chunk.doc_id.upper(), set()).add(chunk.version)
+                temporal_violations += sum(
+                    len(versions) - 1 for versions in versions_by_doc.values() if len(versions) > 1
+                )
+            forbidden_set = {doc_id.upper() for doc_id in item.forbidden_doc_ids}
+            forbidden_violations = sum(
+                1 for chunk in response.chunks if chunk.doc_id.upper() in forbidden_set
             )
-        forbidden_set = {doc_id.upper() for doc_id in item.forbidden_doc_ids}
-        forbidden_violations = sum(
-            1 for chunk in response.chunks if chunk.doc_id.upper() in forbidden_set
-        )
 
-        total_temporal_violations += temporal_violations
-        total_forbidden_violations += forbidden_violations
+            total_temporal_violations += temporal_violations
+            total_forbidden_violations += forbidden_violations
 
-        recall: float | None = None
-        rr: float | None = None
-        if item.expected_doc_ids:
-            expected_set = {doc_id.upper() for doc_id in item.expected_doc_ids}
-            top_5_set = {doc_id.upper() for doc_id in ranked_doc_ids[:5]}
-            recall = len(expected_set & top_5_set) / len(expected_set)
-            rr = _reciprocal_rank(ranked_doc_ids, expected_set)
-            recall_scores.append(recall)
-            rr_scores.append(rr)
+            recall: float | None = None
+            rr: float | None = None
+            if item.expected_doc_ids:
+                expected_set = {doc_id.upper() for doc_id in item.expected_doc_ids}
+                top_5_set = {doc_id.upper() for doc_id in ranked_doc_ids[:5]}
+                recall = len(expected_set & top_5_set) / len(expected_set)
+                rr = _reciprocal_rank(ranked_doc_ids, expected_set)
+                recall_scores.append(recall)
+                rr_scores.append(rr)
 
-        results.append(
-            EvalQueryResult(
-                query_id=item.query_id,
-                query=item.query,
-                as_of_date=item.as_of_date,
-                expected_doc_ids=item.expected_doc_ids,
-                retrieved_doc_ids=ranked_doc_ids,
-                recall_at_5=round(recall, 4) if recall is not None else None,
-                reciprocal_rank=round(rr, 4) if rr is not None else None,
-                temporal_filter_violations=temporal_violations,
-                forbidden_doc_violations=forbidden_violations,
+            results.append(
+                EvalQueryResult(
+                    query_id=item.query_id,
+                    query=item.query,
+                    as_of_date=item.as_of_date,
+                    expected_doc_ids=item.expected_doc_ids,
+                    retrieved_doc_ids=ranked_doc_ids,
+                    recall_at_5=round(recall, 4) if recall is not None else None,
+                    reciprocal_rank=round(rr, 4) if rr is not None else None,
+                    temporal_filter_violations=temporal_violations,
+                    forbidden_doc_violations=forbidden_violations,
+                )
             )
-        )
 
     scored_queries = len(recall_scores)
     mean_recall = round(sum(recall_scores) / scored_queries, 4) if scored_queries > 0 else 0.0

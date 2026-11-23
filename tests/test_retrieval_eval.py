@@ -21,6 +21,7 @@ from medcover.eval import EvalReport, evaluate_retrieval
 from medcover.gold import build_gold
 from medcover.quality import audit_medallion, render_manifest_summary
 from medcover.retrieve import (
+    AskRequest,
     HybridRetriever,
     RetrievedChunk,
     RetrieveRequest,
@@ -66,118 +67,141 @@ def _build_sample_index(tmp_path: Path) -> Settings:
 def test_hybrid_retrieval_filters_as_of_date_codes_type_and_mac_with_ncds(
     tmp_path: Path,
 ) -> None:
-    """Verify RRF search enforces point-in-time dates, HCPCS/ICD-10 arrays, doc_type, and MAC."""
+    """Verify RRF search enforces SCD2 valid_to, HCPCS/ICD-10 arrays, doc_type, and MAC."""
     settings = _build_sample_index(tmp_path)
-    retriever = HybridRetriever(
+    with HybridRetriever(
         settings.gold_dir / "index.duckdb",
         settings=settings,
         embed_fn=_hashed_bow_embed,
-    )
-
-    # Current as_of_date must exclude retired LCD L33381 (retired 2024-06-30).
-    current_bariatric = retriever.search(
-        RetrieveRequest(
-            query="Roux-en-Y gastric bypass bariatric surgery morbid obesity",
-            as_of_date=date(2026, 1, 1),
+    ) as retriever:
+        # Current as_of_date must exclude retired LCD L33381 and superseded L33822 v11.
+        current_bariatric = retriever.search(
+            RetrieveRequest(
+                query="Roux-en-Y gastric bypass bariatric surgery morbid obesity",
+                as_of_date=date(2026, 1, 1),
+            )
         )
-    )
-    assert "L33381" not in {chunk.doc_id for chunk in current_bariatric.chunks}
-    assert all(
-        chunk.effective_date <= date(2026, 1, 1)
-        and (chunk.retired_date is None or chunk.retired_date > date(2026, 1, 1))
-        for chunk in current_bariatric.chunks
-    )
-
-    # Point-in-time lookup before retirement recovers L33381 and excludes post-dated LCDs.
-    historical_bariatric = retriever.search(
-        RetrieveRequest(
-            query="Roux-en-Y gastric bypass bariatric surgery 43644",
-            as_of_date=date(2023, 6, 1),
-            hcpcs_code="43644",
+        assert "L33381" not in {chunk.doc_id for chunk in current_bariatric.chunks}
+        assert all(
+            chunk.effective_date <= date(2026, 1, 1)
+            and (chunk.valid_to is None or chunk.valid_to > date(2026, 1, 1))
+            for chunk in current_bariatric.chunks
         )
-    )
-    assert len(historical_bariatric.chunks) > 0
-    assert historical_bariatric.chunks[0].doc_id == "L33381"
-    assert historical_bariatric.chunks[0].retired_date == date(2024, 6, 30)
 
-    # A date prior to L34998's 2024-01-15 effective_date must exclude L34998.
-    before_moldx = retriever.search(
-        RetrieveRequest(
-            query="MolDX NGS panel EGFR ALK non-small cell lung cancer",
-            as_of_date=date(2023, 12, 31),
-            hcpcs_code="81445",
+        # Multi-version SCD2 check: 2021-06-01 returns ONLY L33822 v11; 2022-04-01+ returns v12.
+        mri_2021 = retriever.search(
+            RetrieveRequest(
+                query="lumbar spine MRI conservative therapy",
+                as_of_date=date(2021, 6, 1),
+                hcpcs_code="72148",
+                doc_type="LCD",
+            )
         )
-    )
-    assert before_moldx.chunks == []
+        assert len(mri_2021.chunks) > 0
+        assert {(c.doc_id, c.version) for c in mri_2021.chunks} == {("L33822", 11)}
+        assert mri_2021.chunks[0].valid_to == date(2022, 4, 1)
 
-    # as_of_date=None disables temporal filtering and returns retired L33381.
-    all_dates_bariatric = retriever.search(
-        RetrieveRequest(
-            query="Roux-en-Y gastric bypass bariatric surgery 43644",
-            as_of_date=None,
-            hcpcs_code="43644",
+        mri_2022_boundary = retriever.search(
+            RetrieveRequest(
+                query="lumbar spine MRI conservative therapy",
+                as_of_date=date(2022, 4, 1),
+                hcpcs_code="72148",
+                doc_type="LCD",
+            )
         )
-    )
-    assert len(all_dates_bariatric.chunks) > 0
-    assert all_dates_bariatric.chunks[0].doc_id == "L33381"
+        assert {(c.doc_id, c.version) for c in mri_2022_boundary.chunks} == {("L33822", 12)}
 
-    # Case-insensitive HCPCS + ICD-10 filter scopes to lumbar spine MRI pair.
-    mri_pair = retriever.search(
-        RetrieveRequest(
-            query="lumbar spine MRI radiculopathy",
-            as_of_date=date(2026, 1, 1),
-            hcpcs_code="72148",
-            icd10_code="m51.16",
+        # Point-in-time lookup before retirement recovers L33381 and excludes post-dated LCDs.
+        historical_bariatric = retriever.search(
+            RetrieveRequest(
+                query="Roux-en-Y gastric bypass bariatric surgery 43644",
+                as_of_date=date(2023, 6, 1),
+                hcpcs_code="43644",
+            )
         )
-    )
-    assert {chunk.doc_id for chunk in mri_pair.chunks} == {"L33822", "A56542"}
+        assert len(historical_bariatric.chunks) > 0
+        assert historical_bariatric.chunks[0].doc_id == "L33381"
+        assert historical_bariatric.chunks[0].retired_date == date(2024, 6, 30)
 
-    # doc_type filter separates LCD from companion billing Article.
-    mri_lcd_only = retriever.search(
-        RetrieveRequest(
-            query="lumbar spine MRI radiculopathy",
-            as_of_date=date(2026, 1, 1),
-            hcpcs_code="72148",
-            doc_type="LCD",
+        # A date prior to L34998's 2024-01-15 effective_date must exclude L34998.
+        before_moldx = retriever.search(
+            RetrieveRequest(
+                query="MolDX NGS panel EGFR ALK non-small cell lung cancer",
+                as_of_date=date(2023, 12, 31),
+                hcpcs_code="81445",
+            )
         )
-    )
-    assert {chunk.doc_id for chunk in mri_lcd_only.chunks} == {"L33822"}
+        assert before_moldx.chunks == []
 
-    # MAC jurisdiction filter returns that MAC's policies plus nationwide NCDs, never other MACs.
-    cataract_mac = retriever.search(
-        RetrieveRequest(
-            query="cataract surgery functional impairment",
-            as_of_date=date(2026, 1, 1),
-            mac_jurisdiction="first coast service options (jn)",
+        # as_of_date=None disables temporal filtering and returns retired L33381.
+        all_dates_bariatric = retriever.search(
+            RetrieveRequest(
+                query="Roux-en-Y gastric bypass bariatric surgery 43644",
+                as_of_date=None,
+                hcpcs_code="43644",
+            )
         )
-    )
-    assert cataract_mac.chunks[0].doc_id == "L35041"
-    assert all(
-        chunk.doc_type == "NCD"
-        or (chunk.mac_jurisdiction or "").lower() == "first coast service options (jn)"
-        for chunk in cataract_mac.chunks
-    )
+        assert len(all_dates_bariatric.chunks) > 0
+        assert all_dates_bariatric.chunks[0].doc_id == "L33381"
 
-    # Nationwide NCDs remain discoverable when filtering by a regional MAC.
-    pet_in_novitas = retriever.search(
-        RetrieveRequest(
-            query="FDG PET scans non-small cell lung cancer",
-            as_of_date=date(2026, 1, 1),
-            mac_jurisdiction="Novitas Solutions (JH/JL)",
+        # Case-insensitive HCPCS + ICD-10 filter scopes to active lumbar spine MRI pair (v12 only).
+        mri_pair = retriever.search(
+            RetrieveRequest(
+                query="lumbar spine MRI radiculopathy",
+                as_of_date=date(2026, 1, 1),
+                hcpcs_code="72148",
+                icd10_code="m51.16",
+            )
         )
-    )
-    assert pet_in_novitas.chunks[0].doc_id == "NCD220.6"
+        assert {chunk.doc_id for chunk in mri_pair.chunks} == {"L33822", "A56542"}
+        assert all(chunk.version == 12 for chunk in mri_pair.chunks if chunk.doc_id == "L33822")
 
-    # Combining mac_jurisdiction + doc_type="LCD" restricts strictly to that MAC's local LCDs.
-    cataract_lcd_only = retriever.search(
-        RetrieveRequest(
-            query="cataract surgery functional impairment",
-            as_of_date=date(2026, 1, 1),
-            mac_jurisdiction="First Coast Service Options (JN)",
-            doc_type="LCD",
+        # doc_type filter separates LCD from companion billing Article.
+        mri_lcd_only = retriever.search(
+            RetrieveRequest(
+                query="lumbar spine MRI radiculopathy",
+                as_of_date=date(2026, 1, 1),
+                hcpcs_code="72148",
+                doc_type="LCD",
+            )
         )
-    )
-    assert {chunk.doc_id for chunk in cataract_lcd_only.chunks} == {"L35041"}
+        assert {(c.doc_id, c.version) for c in mri_lcd_only.chunks} == {("L33822", 12)}
+
+        # MAC filter returns that MAC's local policies plus nationwide NCDs, never other MACs.
+        cataract_mac = retriever.search(
+            RetrieveRequest(
+                query="cataract surgery functional impairment",
+                as_of_date=date(2026, 1, 1),
+                mac_jurisdiction="first coast service options (jn)",
+            )
+        )
+        assert cataract_mac.chunks[0].doc_id == "L35041"
+        assert all(
+            chunk.doc_type == "NCD"
+            or (chunk.mac_jurisdiction or "").lower() == "first coast service options (jn)"
+            for chunk in cataract_mac.chunks
+        )
+
+        # Nationwide NCDs remain discoverable when filtering by a regional MAC.
+        pet_in_novitas = retriever.search(
+            RetrieveRequest(
+                query="FDG PET scans non-small cell lung cancer",
+                as_of_date=date(2026, 1, 1),
+                mac_jurisdiction="Novitas Solutions (JH/JL)",
+            )
+        )
+        assert pet_in_novitas.chunks[0].doc_id == "NCD220.6"
+
+        # Combining mac_jurisdiction + doc_type="LCD" restricts strictly to that MAC's local LCDs.
+        cataract_lcd_only = retriever.search(
+            RetrieveRequest(
+                query="cataract surgery functional impairment",
+                as_of_date=date(2026, 1, 1),
+                mac_jurisdiction="First Coast Service Options (JN)",
+                doc_type="LCD",
+            )
+        )
+        assert {chunk.doc_id for chunk in cataract_lcd_only.chunks} == {"L35041"}
 
 
 def test_hybrid_retrieval_handles_zero_vectors_and_retirement_boundary(tmp_path: Path) -> None:
@@ -376,10 +400,11 @@ def test_byo_key_synthesis_providers_and_zero_key_leakage() -> None:
     assert openai_route.calls[0].request.headers["authorization"] == f"Bearer {secret_key}"
     prompt_body = json.loads(openai_route.calls[0].request.content.decode("utf-8"))
     assert (
-        "Effective: 2022-04-01, Retired: none, HCPCS: 72148"
+        "Effective: 2022-04-01, Valid To: open, HCPCS: 72148"
         in (prompt_body["messages"][1]["content"])
     )
-    assert openai_res.grounding_verified is True
+    assert openai_res.citations_verified is True
+    assert "provenance" in openai_res.disclaimer
     assert openai_res.cited_doc_ids == ["L33822"]
     assert secret_key not in openai_res.model_dump_json()
 
@@ -397,7 +422,7 @@ def test_byo_key_synthesis_providers_and_zero_key_leakage() -> None:
     )
     assert anthropic_route.called
     assert anthropic_route.calls[0].request.headers["x-api-key"] == secret_key
-    assert anthropic_res.grounding_verified is False
+    assert anthropic_res.citations_verified is False
     assert anthropic_res.ungrounded_doc_ids == ["FAKE999"]
 
     gemini_route = respx.post(
@@ -417,7 +442,19 @@ def test_byo_key_synthesis_providers_and_zero_key_leakage() -> None:
     assert gemini_route.called
     assert gemini_route.calls[0].request.headers["x-goog-api-key"] == secret_key
     assert secret_key not in str(gemini_route.calls[0].request.url)
-    assert gemini_res.grounding_verified is True
+    assert gemini_res.citations_verified is True
+
+    # Invalid model names (path traversal / query injection) must fail before outbound HTTP calls.
+    with pytest.raises(ValueError, match="model must match"):
+        AskRequest(query="Lumbar MRI?", provider="gemini", model="../v1/files?key=leak")
+    with pytest.raises(ValueError, match="model must match"):
+        synthesize_answer(
+            "Lumbar MRI criteria?",
+            [chunk],
+            provider="gemini",
+            api_key=secret_key,
+            model="../admin/secret",
+        )
 
     # Upstream 401 failure must never echo the API key in the exception message.
     respx.post("https://api.openai.com/v1/chat/completions").mock(

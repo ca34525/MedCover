@@ -23,6 +23,10 @@ def test_settings_defaults_and_medallion_paths() -> None:
     assert settings.embedding_dim == 384
     assert settings.chunk_token_limit == 450
     assert settings.chunk_token_overlap == 60
+    assert settings.max_chunk_tokens == 900
+    assert settings.duckdb_storage_version == "v1.5.0"
+    assert settings.duckdb_memory_limit == "1GB"
+    assert settings.duckdb_threads == 2
     assert settings.max_quarantine_rate == 0.10
     assert settings.min_recall_at_5 == 0.85
     assert settings.bronze_dir == Path("data/bronze")
@@ -31,10 +35,13 @@ def test_settings_defaults_and_medallion_paths() -> None:
     assert settings.releases_dir == Path("data/releases")
 
 
-def test_settings_rejects_overlap_gte_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify invalid chunk overlap configuration fails fast via both Settings and get_settings."""
+def test_settings_rejects_invalid_chunk_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify invalid chunk overlap or max_chunk_tokens configuration fails fast."""
     with pytest.raises(ValueError, match="chunk_token_overlap"):
         Settings(chunk_token_limit=100, chunk_token_overlap=100)
+
+    with pytest.raises(ValueError, match="max_chunk_tokens"):
+        Settings(chunk_token_limit=450, max_chunk_tokens=400)
 
     monkeypatch.setenv("MEDCOVER_CHUNK_TOKEN_LIMIT", "100")
     monkeypatch.setenv("MEDCOVER_CHUNK_TOKEN_OVERLAP", "100")
